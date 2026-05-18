@@ -63,6 +63,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_top_n_in: 30,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
+      floor_ratio: undefined,
       ...CROSS_MODAL_DEFAULTS,
     });
   });
@@ -81,6 +82,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_top_n_in: 30,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
+      floor_ratio: undefined,
       ...CROSS_MODAL_DEFAULTS,
     });
   });
@@ -99,6 +101,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_top_n_in: 30,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
+      floor_ratio: undefined,
       ...CROSS_MODAL_DEFAULTS,
     });
   });
@@ -279,10 +282,36 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
 
   test('KNOBS_HASH_VERSION constant exposed for migrations to bump on schema change', () => {
     // v0.35.0.0+ bumped 1→2 to fold reranker fields into the cache key.
-    // v0.36 bumped 2→3 to fold 7 cross-modal knobs into the cache key (D2 fix
-    // — without this, a text-mode cache hit could silently serve to an
-    // image-mode caller).
+    // v0.35.6.0 bumped 2→3 to fold floor_ratio (codex outside-voice T1 —
+    // preventing cross-floor cache contamination).
+    // v0.36 piggybacks on v=3 with 7 additional cross-modal knobs appended
+    // (CDX2-F13 append-only convention) so a text-mode cache hit can never
+    // silently serve to an image-mode caller.
     expect(KNOBS_HASH_VERSION).toBe(3);
+  });
+
+  test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
+    // Without this, a no-floor write would be served to a floor-enabled read
+    // — direct ranking-correctness leak. Same bug class CDX-4 closed in v0.32.3
+    // for the other search-lite knobs.
+    const noFloor = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const withFloor = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
+    expect(noFloor).not.toBe(withFloor);
+  });
+
+  test('T1 (codex): different floor_ratio values produce different hashes', () => {
+    // 0.85 and 0.90 are distinct cache rows. 4-decimal precision in the hash
+    // input means 0.85 and 0.851 also differ (consumers tuning by hundredths
+    // get a clean cache split).
+    const a = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
+    const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.90 } }));
+    expect(a).not.toBe(b);
+  });
+
+  test('same floor_ratio produces same hash (idempotent cache key)', () => {
+    const a = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
+    const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
+    expect(a).toBe(b);
   });
 });
 
@@ -324,6 +353,20 @@ describe('loadOverridesFromConfig flat-map parser', () => {
     expect(loadOverridesFromConfig({ 'search.cache.similarity_threshold': '1.5' }).cache_similarity_threshold).toBeUndefined();
     expect(loadOverridesFromConfig({ 'search.cache.similarity_threshold': '0' }).cache_similarity_threshold).toBeUndefined();
     expect(loadOverridesFromConfig({ 'search.cache.similarity_threshold': '-0.1' }).cache_similarity_threshold).toBeUndefined();
+  });
+
+  test('v0.35.6.0: floor_ratio parses valid 0..1 values', () => {
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '0.85' }).floor_ratio).toBe(0.85);
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '0' }).floor_ratio).toBe(0);
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '1' }).floor_ratio).toBe(1);
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '0.5' }).floor_ratio).toBe(0.5);
+  });
+
+  test('v0.35.6.0: floor_ratio rejects out-of-range values silently', () => {
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '-0.1' }).floor_ratio).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': '1.5' }).floor_ratio).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': 'NaN' }).floor_ratio).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.floor_ratio': 'cheese' }).floor_ratio).toBeUndefined();
   });
 });
 

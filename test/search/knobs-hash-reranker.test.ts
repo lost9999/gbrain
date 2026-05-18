@@ -2,7 +2,8 @@
  * v0.35.0.0 — knobsHash reranker-field participation tests.
  *
  * Pins:
- *  - KNOBS_HASH_VERSION === 2 (bumped from 1; CDX1-F14).
+ *  - KNOBS_HASH_VERSION === 3 (bumped 1→2 v0.35.0.0 for reranker; 2→3 v0.35.6.0
+ *    for floor_ratio — codex outside-voice T1 cross-floor cache contamination).
  *  - All 5 new reranker fields participate in the hash:
  *      reranker_enabled, reranker_model, reranker_top_n_in,
  *      reranker_top_n_out, reranker_timeout_ms.
@@ -42,11 +43,11 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 3 (v0.36 cross-modal wave: bumped from 2 to fold cross-modal knobs in)', () => {
-    // v0.35: 1→2 to fold reranker fields. v0.36: 2→3 to fold cross-modal
-    // knobs (D2 cache contamination fix). When this bumps, the prior
-    // version's cache rows distinguish naturally via the version prefix
-    // in the hash input — duplicate rows clear within cache.ttl_seconds.
+  test('version is 3 (1→2 v0.35.0.0 reranker; 2→3 v0.35.6.0 floor_ratio + v0.36 cross-modal appends)', () => {
+    // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
+    // floor_ratio. v0.36: piggybacks on v=3 with 7 cross-modal knobs
+    // appended (CDX2-F13 append-only convention) so a text-mode cache
+    // hit can never silently serve to an image-mode caller.
     expect(KNOBS_HASH_VERSION).toBe(3);
   });
 

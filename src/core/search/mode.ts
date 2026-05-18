@@ -95,6 +95,24 @@ export interface ModeBundle {
   /** HTTP timeout in ms (default 5000). Threaded into gateway.rerank. */
   reranker_timeout_ms: number;
 
+  /**
+   * v0.35.6.0 — floor-ratio gate for metadata-axis boost stages (backlink,
+   * salience, recency). `undefined` = no gate (default for all three modes;
+   * preserves prior behavior bit-for-bit). When set to a number in [0, 1],
+   * each gated stage skips results whose score is below
+   * `floorRatio * topScore`, where topScore is computed ONCE at
+   * runPostFusionStages entry from the post-cosine-rescore snapshot.
+   *
+   * Sensible operator override values for dense-embedder corpora: 0.85-0.95.
+   * Default stays undefined until per-corpus ablation evidence supports a
+   * mode-level default. See `TODOS.md` floor-ratio ablation entry.
+   *
+   * Scoped to the three metadata boost stages — exact-match boost
+   * (intent-weights.applyExactMatchBoost) runs independently as a lexical
+   * relevance signal and is NOT gated.
+   */
+  floor_ratio: number | undefined;
+
   // v0.36 cross-modal wave knobs (D2 + D3 + D6 + D8 + D13 + LLM-intent).
   // All three mode bundles default these to the same values — cross-modal
   // is opt-in per-call (D6 weighting), opt-in per-brain (D8 unified flags),
@@ -169,6 +187,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
+    // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
+    // (TODOS.md) gates any default flip.
+    floor_ratio: undefined,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -194,7 +215,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
-    // v0.36 cross-modal defaults
+    // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
+    // (TODOS.md) gates any default flip.
+    floor_ratio: undefined,
+    // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
     image_query_text_refinement_weight: 0.4,
@@ -221,7 +245,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
-    // v0.36 cross-modal defaults
+    // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
+    // (TODOS.md) gates any default flip.
+    floor_ratio: undefined,
+    // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
     image_query_text_refinement_weight: 0.4,
@@ -260,6 +287,8 @@ export interface SearchKeyOverrides {
   // number | undefined.
   reranker_top_n_out?: number | null;
   reranker_timeout_ms?: number;
+  // v0.35.6.0 — floor-ratio gate override.
+  floor_ratio?: number;
   // v0.36 cross-modal overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -291,6 +320,8 @@ export interface SearchPerCallOpts {
   reranker_top_n_in?: number;
   reranker_top_n_out?: number | null;
   reranker_timeout_ms?: number;
+  // v0.35.6.0 — floor-ratio per-call override.
+  floor_ratio?: number;
   // v0.36 cross-modal per-call overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -357,6 +388,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     reranker_top_n_in: pick('reranker_top_n_in'),
     reranker_top_n_out: pick('reranker_top_n_out'),
     reranker_timeout_ms: pick('reranker_timeout_ms'),
+    // v0.35.6.0 — floor-ratio resolved via the same pick chain.
+    floor_ratio: pick('floor_ratio'),
     // v0.36 cross-modal knobs
     cross_modal_both_text_weight: pick('cross_modal_both_text_weight'),
     cross_modal_both_image_weight: pick('cross_modal_both_image_weight'),
@@ -415,21 +448,24 @@ export function attributeKnob<K extends keyof ModeBundle>(
  */
 // v0.35.0.0+ bump 1→2: reranker fields participate in the cache key so a
 // tokenmax-with-reranker write can't be served to a reranker-off lookup.
+// v0.35.6.0   bump 2→3: floor_ratio participates so a floor-on write can't
+// be served to a floor-off lookup (cross-floor contamination, codex T1).
 // CDX2-F13 convention: under a version bump, additions are APPEND-ONLY at
 // the end of `parts[]` — reordering existing fields would silently rebuild
 // the hash for every existing row.
 //
 // CDX2-F12 mid-deploy duplicate-row note: because `cacheRowId()` (in
-// src/core/search/query-cache.ts) includes knobsHash, a v=1 process and a
-// v=2 process writing the same `(source_id, query_text)` produce DISTINCT
+// src/core/search/query-cache.ts) includes knobsHash, a v=2 process and a
+// v=3 process writing the same `(source_id, query_text)` produce DISTINCT
 // row IDs. Expect a temporary hit-rate dip + cache-row doubling for hot
 // queries during a rolling deploy. Clears naturally within
 // `cache.ttl_seconds` (default 3600s). The CHANGELOG note covers this.
 //
-// v0.36 bump 2→3: cross-modal knobs participate in the cache key (D2). Any
-// search where crossModal / unified_multimodal / llm_intent flipped should
-// land in a distinct cache row — otherwise a text-mode cache hit could
-// silently serve to an image-mode caller.
+// v0.36 wave: cross-modal knobs ALSO participate in v=3 hash (D2 cache
+// contamination fix — a text-mode cache hit cannot silently serve an
+// image-mode caller). v0.35.6.0's floor_ratio bump and v0.36's cross-modal
+// extensions both land under v=3, with cross-modal fields appended after
+// the floor_ratio entry (CDX2-F13 append-only convention).
 export const KNOBS_HASH_VERSION = 3;
 
 export function knobsHash(knobs: ResolvedSearchKnobs): string {
@@ -451,6 +487,10 @@ export function knobsHash(knobs: ResolvedSearchKnobs): string {
     `rri=${knobs.reranker_top_n_in}`,
     `rro=${knobs.reranker_top_n_out ?? 'none'}`,
     `rrt=${knobs.reranker_timeout_ms}`,
+    // v=3 additions (append-only). Use 4-decimal precision so 0.85 and
+    // 0.851 differ in the hash; undefined uses literal 'none' so a
+    // floor-off write and a floor-on write key into different rows.
+    `fr=${knobs.floor_ratio === undefined ? 'none' : knobs.floor_ratio.toFixed(4)}`,
     // v=3 cross-modal additions (append-only).
     `cmbt=${knobs.cross_modal_both_text_weight.toFixed(2)}`,
     `cmbi=${knobs.cross_modal_both_image_weight.toFixed(2)}`,
@@ -546,6 +586,16 @@ export function loadOverridesFromConfig(
     if (Number.isFinite(n) && n > 0) out.reranker_timeout_ms = n;
   }
 
+  // v0.35.6.0 — floor-ratio config key. Accepts a number in [0, 1]; values
+  // outside that range silently fall through (no override applied). The
+  // runtime computeFloorThreshold also guards against out-of-range so a
+  // malformed value never gates anything — defense in depth.
+  const fr = get('search.floor_ratio');
+  if (fr !== undefined) {
+    const n = parseFloat(fr);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.floor_ratio = n;
+  }
+
   // v0.36 cross-modal overrides (D3 registry)
   const cmbt = get('search.cross_modal.both_mode_text_weight');
   if (cmbt !== undefined) {
@@ -598,6 +648,8 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.reranker.top_n_in',
   'search.reranker.top_n_out',
   'search.reranker.timeout_ms',
+  // v0.35.6.0 — floor-ratio gate
+  'search.floor_ratio',
   // v0.36 cross-modal keys (D3)
   'search.cross_modal.both_mode_text_weight',
   'search.cross_modal.both_mode_image_weight',

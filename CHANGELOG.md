@@ -121,6 +121,269 @@ Auto-flip prompt fires at coverage=100% so the last step is suggested inline.
 - The `voyage-multimodal-3` real-API E2E test fails against Voyage's current API because the test fixture is AVIF and Voyage now rejects that format. Fix is a separate one-line fixture swap; failure is pre-existing on master.
 
 Closes #1127 (spec doc preserved at `docs/issues/cross-modal-search.md`).
+## [0.35.8.0] - 2026-05-17
+
+**Phantom unprefixed entity pages drain automatically on the next autopilot cycle. Your `alice.md` residue gets folded into `people/alice-example.md` with embeddings + strikethrough state preserved, no operator action needed.**
+
+The cleanup half of PR #1010 (which shipped the three preventive layers that stopped NEW phantoms). The original `gbrain merge-phantoms` command was scrapped after 30 codex rounds because it duplicated `extract_facts` reconciliation logic in a parallel implementation. This release does the same job by folding the redirect into the existing cycle phase with two NEW lossless primitives. Capped at 50 phantoms per cycle (configurable) so a brain with hundreds of phantoms drains over a handful of cycles without stalling any one of them.
+
+### The phantom-pile numbers that matter
+
+On a brain with a known historical phantom pile, the autopilot cycle now reports three new counters in `CycleReport.totals`. The shape of one real cycle on a representative test corpus:
+
+| Counter                       | Meaning                                                                | Run 1 | Run 2 |
+|-------------------------------|------------------------------------------------------------------------|-------|-------|
+| `phantoms_redirected`         | Phantoms successfully migrated to canonical                            | 50    | 0     |
+| `phantoms_ambiguous`          | Phantoms skipped because canonical was multi-candidate (operator triage) | 0     | 0     |
+| `phantoms_skipped_drift`      | Phantoms skipped because disk fence ≠ DB body                          | 0     | 0     |
+
+Run 1 caps at the per-cycle limit. Run 2 is a clean no-op because phantoms 1–50 are now soft-deleted (deleted_at filter excludes them from the predicate). For a 200-phantom brain you'd see 50/50/50/50 across four cycles.
+
+### What you can now do
+
+**Find your `alice.md` already folded into `people/alice-example.md` after the next autopilot cycle.** Pre-v0.35.6, gbrain would create phantom pages at the brain root whenever an entity name fell through the resolver chain (e.g. fuzzy match scored below 0.4 on `"Alice"` because pg_trgm hates short bare names). PR #1010 stopped new phantoms via prefix-expansion + stub-guard + dropped-fact audit. This release drains the existing pile: the next cycle's `extract_facts` phase walks unprefixed-slug pages, resolves each to its canonical via a phantom-specific resolver that bypasses exact-self-match, migrates fact rows via a new DB-level UPDATE that preserves every column (embedding, validUntil, strikethrough/forgotten state, supersession metadata, source_session, confidence), merges the disk fence with dedup-guarded row_num continuation, refreshes `content_hash` so the next `gbrain sync` sees the canonical as unchanged, rewrites links table FKs, soft-deletes the phantom, and unlinks the `.md` file. All in one bounded pass per cycle. Backlinks via `[[alice]]` in markdown bodies still point at the original phantom slug — wiki-link text rewrite is a follow-up because it requires editing every other markdown file's body.
+
+**Preview the cleanup before committing it.** `gbrain dream --phase extract_facts --dry-run` runs the full predicate + resolver + drift-check chain and reports counters, but writes nothing to FS or DB or the audit log. Same dryRun knob `extract_facts` already had — no new flags to learn.
+
+**Tune the per-cycle cap if your brain has thousands of phantoms.** `GBRAIN_PHANTOM_REDIRECT_LIMIT=200 gbrain dream --phase extract_facts` overrides the default 50. Trade-off is cycle latency: each phantom takes ~10–20 DB queries and one disk write, so 200 phantoms is ~5s of work plus the once-per-cycle lock acquisition. The cap exists because `extract_facts` is part of every autopilot cycle and we don't want a single cycle to stall on a one-time cleanup.
+
+**Triage ambiguous phantoms via the new audit log.** When a phantom like `alice` matches BOTH `people/alice-example` AND `people/alice-other`, the redirect refuses to guess. The audit log entry at `~/.gbrain/audit/phantoms-YYYY-Www.jsonl` records `outcome: ambiguous` with the full candidate list (slug + connection_count) so an operator can review and decide. ISO-week-rotated; honors `GBRAIN_AUDIT_DIR` for container deployments.
+
+### Itemized changes
+
+#### New engine surface
+- `BrainEngine.refreshPageBody(slug, sourceId, compiled_truth, timeline, content_hash)` — narrow UPDATE of three columns + updated_at. Skips soft-deleted rows. Implemented on Postgres + PGLite with parity tests.
+- `BrainEngine.migrateFactsToCanonical(phantomSlug, canonicalSlug, sourceId)` — DB-level UPDATE that rewrites `entity_slug` + `source_markdown_slug` on active fact rows, preserving every other column. Returns `{migrated: number}`. Idempotent (re-run returns 0). Skips expired rows so the supersession audit trail stays intact.
+
+#### New resolver primitives
+- `resolvePhantomCanonical(engine, sourceId, phantomSlug)` (exported from `src/core/entities/resolve.ts`) — fuzzy + prefix-expansion path, skips the exact-slug match step that made the original redesign attempt a no-op (the phantom slug exact-matches itself). Returns the resolved canonical (must contain `/`) or null.
+- `findPrefixCandidates(engine, sourceId, token)` (exported same file) — standalone SQL query returning ALL candidates across configured directories, NOT just per-directory top-1. Used by the ambiguity gate. Cap of 10. Returns rows ordered by connection_count DESC, slug ASC.
+
+#### New orchestrator
+- `src/core/cycle/phantom-redirect.ts` — `runPhantomRedirectPass` + `tryRedirectPhantom`. The per-cycle pass acquires `gbrain-sync` writer lock once at start (30s bounded retry), walks up-to-`GBRAIN_PHANTOM_REDIRECT_LIMIT` unprefixed slugs, handles each, releases lock. Per-phantom flow: body-shape gate (strict zero-residue) → resolve canonical → ambiguity check → bi-directional drift check → dry-run early exit → materialize canonical .md if DB-only → append phantom fence rows to canonical's fence (dedup-guarded by claim+valid_from) → refreshPageBody → migrateFactsToCanonical → rewriteLinks → softDeletePage → unlink phantom .md. Touched canonicals returned to caller so the main reconcile loop derives their DB facts from the merged fence.
+- `src/core/facts/phantom-audit.ts` — JSONL audit at `~/.gbrain/audit/phantoms-YYYY-Www.jsonl` with ISO-week rotation. Honors `GBRAIN_AUDIT_DIR`. Best-effort writes (failures logged to stderr, never throw).
+
+#### Cycle wiring
+- `runPhaseExtractFacts(engine, brainDir, sourceId, dryRun, changedSlugs?)` — new signature threads sourceId via `resolveSourceForDir(engine, brainDir)` so multi-source brains route the redirect pass correctly.
+- `runExtractFacts` opts gain `brainDir?: string`. When provided, the phantom pre-pass runs after the legacy-row guard and before the main reconcile loop. The main loop's slug set is UNIONed with `touched_canonicals` so canonical pages get reconciled from the merged disk fence in the same cycle (the round-14 risk specialized to incremental mode).
+- Three new `CycleReport.totals` keys: `phantoms_redirected`, `phantoms_ambiguous`, `phantoms_skipped_drift`. Schema-additive, `schema_version` stays 1.
+- Two extract_facts result fields surface to phase details: `phantoms_lock_busy`, `phantoms_more_pending`. Daily report can flag "lock was contended this cycle — try again later" and "50/N phantoms processed, N-50 pending next cycle."
+
+#### Codex outside-voice findings (all 12 incorporated pre-implementation)
+The original /plan-eng-review proposed reusing `writeFactsToFence` for the migration. Codex caught seven blockers + five risks in pre-implementation review, including: `resolveEntitySlug` exact-self-matches the phantom slug → main path would be a no-op; `writeFactsToFence` is append-only-with-new-row-numbers and drops embeddings + supersession state; `rewriteLinks` rewrites DB FK only (wiki-link text in compiled_truth stays); raw-`compiled_truth` materialization produces malformed `.md` (no frontmatter); the narrow `refreshPageBody` left `content_hash` stale so sync would re-import the canonical defeating the no-op-second-cycle premise; per-phantom 30s lock × 50 cap = 25min worst-case stall; `runPhaseExtractFacts` didn't pass sourceId so multi-source cleanup wouldn't fire. The shipping design addresses all twelve.
+
+#### Known limitations (follow-up TODOs)
+- **Wiki-link text rewrite**: `[[alice]]` references in other pages' markdown bodies still point at the phantom slug. Manual operator command in a future PR. Preventive resolver in PR #1010 ensures new writes go to canonical, so this is a one-time historical concern.
+- **Unified write-path lock**: `gbrain-sync` serializes the redirect vs `performSync` but doesn't cover MCP `put_page`, the facts queue, or direct `writeFactsToFence`. A future design pass will widen the lock scope; the current design is best-effort serialization, not a hard contract.
+
+#### Tests
+- `test/phantom-redirect.test.ts` — 38 hermetic PGLite unit cases covering all 12 codex findings, all 8 cascade-table regression rounds (9, 12, 14, 17, 19/20, 22, 27/29/30, 2-P1), and the Section 1/2/4 decision points (A1 incremental-mode, A2 lock contract, A3 body-shape gate, C1 phantom-DB-wipe, C4 lock retry, P1 per-cycle cap, D5 ambiguity audit, D10 dry-run, D12 phantom-first order).
+- `test/phantom-redirect-engine-parity.test.ts` — 6 cases asserting `refreshPageBody` + `migrateFactsToCanonical` produce byte-equivalent results on PGLite and Postgres (deleted_at filter, source_id scope, metadata preservation, idempotency, expired-row skip).
+- `test/e2e/phantom-redirect.test.ts` — 4 real-Postgres E2E cases: bulk-pile cycle with cap=50, steady-state no-op, concurrent-sync lock-busy seal, postgres-js text-string embedding survives migration (round-12 pin).
+
+## To take advantage of v0.35.8.0
+
+`gbrain upgrade` will automatically pick up the new logic. The phantom-redirect pass fires on the very next `extract_facts` phase — autopilot cycles, manual `gbrain dream`, anything that walks the phase.
+
+1. **Preview the cleanup first** (recommended on brains with many phantoms):
+   ```bash
+   gbrain dream --phase extract_facts --dry-run --dir /path/to/brain
+   ```
+   The output's `phantoms_redirected` counter shows how many would be folded. No DB or FS changes occur in dry-run.
+
+2. **Run the real pass:**
+   ```bash
+   gbrain dream --phase extract_facts --dir /path/to/brain
+   ```
+
+3. **Inspect the audit log:**
+   ```bash
+   cat ~/.gbrain/audit/phantoms-$(date +%Y-W%V).jsonl
+   ```
+   One line per phantom decision. `outcome: redirected` has `canonical_slug` + `fact_count`. `outcome: ambiguous` lists the candidate slugs so you can manually pick one (move the phantom's body content under the correct canonical, delete the phantom .md, run sync).
+
+4. **For very large piles**, raise the per-cycle cap:
+   ```bash
+   GBRAIN_PHANTOM_REDIRECT_LIMIT=200 gbrain dream --phase extract_facts --dir /path/to/brain
+   ```
+
+5. **If `gbrain doctor` warns** about anything after the redirect, please file an issue at https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/audit/phantoms-*.jsonl`
+   - which step looks wrong
+## [0.35.7.0] - 2026-05-17
+
+**The contradiction probe grew up. Typed claims over time, regressions detected automatically, founder scorecards as a one-liner.**
+
+v0.35.3.1 taught the probe to see dates. v0.35.7 turns dates into a proper time-series substrate. Your `## Facts` fences can now carry typed metric assertions (mrr=50000, arr=2000000, team_size=12), the consolidate cycle phase writes `valid_until` on chronologically-superseded facts, and two new commands turn that data into operator signal: `gbrain eval trajectory <entity>` shows the sorted claim history with regressions flagged inline, and `gbrain founder scorecard <entity>` rolls up claim accuracy, consistency, growth direction, and red flags into one JSON payload.
+
+This is the wave the original temporal-contradiction RFC deferred to "Phases 2-4." Three rounds of review (CEO, eng, codex outside-voice) caught a security regression in the planned API, a pre-existing cycle-idempotency bug that would have poisoned trajectory data on every dream cycle re-run, and a misidentified file path for the LLM extraction prompt — all fixed before any code landed.
+
+### What you can now do
+
+**Author typed metric claims in the `## Facts` fence.** The fence widens from 10 to 14 columns when a row carries `claim_metric`, `claim_value`, `claim_unit`, `claim_period`. Mixed fences (some typed rows, some not) work fine — the renderer stays at 10 cells when every row's typed fields are empty, so existing brains don't see diff churn. Metric labels normalize to lowercase snake_case (`MRR` → `mrr`, `Monthly Recurring Revenue` → `mrr`) so trajectory queries don't fragment across capitalization variants. Fifteen common founder metrics have canonical names in the seed map; unknown labels lowercase + underscore-collapse and pass through.
+
+**Get chronological metric trajectories on any entity.** `gbrain eval trajectory companies/acme-example` prints a sorted history with auto-detected regressions flagged inline. `--metric mrr` filters to a single metric. `--since 2026-01-01 --until 2026-07-31` narrows the window. `--json` returns the stable `schema_version: 1` envelope `{points, regressions, drift_score, schema_version}`. Regression threshold is 10% by default, override via `GBRAIN_TRAJECTORY_REGRESSION_THRESHOLD`. The drift_score is `1 - mean(cosine(emb[i], emb[i-1]))` over the trajectory's existing embeddings: 0 means narrative stable, 1 means every claim is unrelated; null when fewer than 3 typed points have embeddings.
+
+**Roll up an entity into a founder scorecard.** `gbrain founder scorecard companies/acme-example` produces four signals: claim_accuracy (over resolved takes), consistency (1 minus the fraction of metric value-changes), growth_trajectory (direction + delta per metric), and red_flags (regressions + high drift + missed predictions). `--json` for a stable contract that any downstream system can consume. Default window is the last year; `--since` / `--until` to narrow.
+
+**Reach trajectories via the MCP `find_trajectory` op** — read scope, not localOnly. OAuth clients query other agents' brains directly. Visibility filtering matches `recall`'s posture: remote callers see only `visibility='world'` facts; local CLI sees everything. Source-scoped via the existing `sourceScopeOpts` v0.34.1.0 pattern — federated `allowedSources` clients get the union; scalar `sourceId` clients see their one source.
+
+**Run the dream cycle without poisoning trajectory data.** v0.35.7 fixes a pre-existing cycle idempotency bug: before this wave, running the full cycle twice in a row would append duplicate takes via `MAX(row_num)+1` after `extract_facts` wiped `consolidated_at` on every fact. The fix is a semantic upsert keyed on `(page_id, claim, since_date)` so re-promotion of a stable cluster reuses the existing take. The autopilot can now run on a cron without silently doubling your facts table's promotion count.
+
+**Cycle-inserted facts now arrive with embeddings.** Before this wave, the `extract_facts` cycle phase inserted fence-derived facts with `embedding = NULL`, which broke consolidate's cosine clustering and any downstream embedding-dependent feature (drift score, semantic similarity in recall). v0.35.7 batches `gateway.embed()` after fence parse and threads embeddings into `insertFacts`. ~$0.02 per 1K facts at OpenAI 3-large pricing; falls open when the embedding gateway is unavailable.
+
+**Fact valid_from now reflects claim dates, not import timestamps.** Eng review caught that `extractFactsFromFenceText` returned `valid_from: undefined` when a fence row lacked an explicit `validFrom:`, which fell through to `insertFacts`'s `now()` default. So a meeting page dated 2026-04-28 used to land its facts as claimed-on-today instead of claimed-on-the-meeting-date — and every trajectory query against existing fences showed import dates instead of claim dates. The fix threads `pages.effective_date` (v0.29.1+) as the fallback. Precedence chain: explicit fence `validFrom:` > `pages.effective_date` > `now()`.
+
+### Itemized changes
+
+- **Schema migration v67** (`facts_typed_claim_columns`) adds four optional columns to `facts`: `claim_metric TEXT`, `claim_value DOUBLE PRECISION`, `claim_unit TEXT`, `claim_period TEXT`. Plus partial index `facts_typed_claim_idx ON facts (entity_slug, claim_metric, valid_from) WHERE claim_metric IS NOT NULL`. All nullable; metadata-only on both engines.
+- `ParsedFact` (`src/core/facts-fence.ts`) gains optional `claimMetric`, `claimValue`, `claimUnit`, `claimPeriod`. Parser tolerates both 10-cell (legacy) and 14-cell (widened) row shapes. Renderer emits 14 cells iff any row has a non-undefined typed field; otherwise stays at 10-cell for backward compat. Numeric `claimValue` cell tolerates comma thousand separators (`50,000` → `50000`).
+- `extractFactsFromFenceText` (`src/core/facts/extract-from-fence.ts`) gains optional `pageEffectiveDate` in opts. Three-branch precedence: fence row > pageEffectiveDate > undefined (engine defaults to `now()`). Metric normalization via `normalizeMetricLabel` with a 15-entry seed map for common founder metrics.
+- `src/core/facts/extract.ts` (the MCP put_page / backstop Haiku call site, NOT the cycle phase — Codex F2 fix) extends its system prompt to optionally emit `metric/value/unit/period` for metric-shaped claims. Backward compatible — non-metric claims emit nulls.
+- `NewFact` interface (`src/core/engine.ts`) gains `claim_metric`, `claim_value`, `claim_unit`, `claim_period` (all nullable). Postgres + PGLite `insertFact` / `insertFacts` SQL extended.
+- `BrainEngine.findTrajectory` method added to both engines. Source-scoped (`sourceId` scalar fast path + `sourceIds` federated array), visibility-filtered when `remote=true`. Single SQL query, `ORDER BY valid_from ASC, id ASC` for deterministic ordering (R3 pin).
+- `src/core/trajectory.ts` (new file) — pure functions `detectRegressions`, `computeDriftScore`, `computeTrajectoryStats`. Exported `TRAJECTORY_SCHEMA_VERSION = 1`. Threshold knob via `GBRAIN_TRAJECTORY_REGRESSION_THRESHOLD` env var.
+- `find_trajectory` MCP op (`src/core/operations.ts`) — scope: read, not localOnly. Routes through `sourceScopeOpts(ctx)` + threads `ctx.remote` for visibility filtering. Strips raw `Float32Array` embeddings from the wire response.
+- `gbrain eval trajectory <entity>` CLI (`src/commands/eval-trajectory.ts`). Pure data fn + JSON formatter + human formatter + thin-client routing seam.
+- `gbrain founder scorecard <entity>` CLI (`src/commands/founder-scorecard.ts`). Pure aggregation function `computeFounderScorecard` exported for tests. Thin-client routing falls back to trajectory-only when remote.
+- `consolidate` cycle phase (`src/core/cycle/phases/consolidate.ts`) gains semantic upsert keyed on `(page_id, claim, since_date)` + chronological `valid_until` writeback on each cluster. Re-running the full cycle on stable input produces zero new takes (R7 pin) and zero `valid_until` diffs (idempotent).
+- `extract_facts` cycle phase (`src/core/cycle/extract-facts.ts`) batch-embeds via `gateway.embed()` before `insertFacts`. Threads `page.effective_date` as the `pageEffectiveDate` fallback.
+- New tests: `test/facts-fence-typed.test.ts` (17 cases — round-trip, normalization, valid_from precedence), `test/consolidate-valid-until.test.ts` (4 cases — R4a chronological writeback, R4b/R7 cycle idempotency), `test/engine-find-trajectory.test.ts` (18 cases — engine + trajectory.ts pure functions), `test/operations-find-trajectory.test.ts` (9 cases — MCP op shape + visibility + source scoping), `test/eval-trajectory.test.ts` (7 cases — CLI), `test/founder-scorecard.test.ts` (9 cases — rollup math), `test/eval-contradictions/no-valid-until-write.test.ts` (4 cases — R1+R8 grep guards).
+- Migration v67 test added to `test/migrate.test.ts` (6 cases — shape, source-shape, idempotency, runtime materialization, backward compat with nullable columns).
+
+## To take advantage of v0.35.7.0
+
+`gbrain upgrade` should do this automatically. The wave ships migration v67 (`facts_typed_claim_columns`); `apply-migrations` runs it transparently.
+
+1. **Verify the migration applied:**
+   ```bash
+   gbrain doctor --json
+   ```
+   Look for `schema_version: 67`. If it's still lower, run `gbrain apply-migrations --yes`.
+2. **Try the new commands on an existing entity:**
+   ```bash
+   gbrain eval trajectory <some-entity-slug>
+   gbrain founder scorecard <some-entity-slug>
+   ```
+   Without any typed-claim data yet, `eval trajectory` will say "(no typed claims for this entity in the window)". That's normal — the substrate is now ready; the data lands as you author typed fence rows or as the next dream cycle's Haiku extraction populates them on conversation-derived facts.
+3. **Author a typed-claim fence row (optional):**
+   In any entity's `## Facts` fence, extend a row with typed columns:
+   ```markdown
+   | # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context | claim_metric | claim_value | claim_unit | claim_period |
+   |---|-------|------|------------|------------|------------|------------|-------------|--------|---------|--------------|-------------|------------|--------------|
+   | 1 | MRR hit $50K | fact | 1.0 | private | high | 2026-01-15 |  | OH transcript |  | mrr | 50000 | USD | monthly |
+   ```
+   On next `gbrain sync` + dream cycle, the fact lands with typed fields. `gbrain eval trajectory` picks it up immediately.
+4. **(Optional) Tighten the regression threshold:**
+   ```bash
+   export GBRAIN_TRAJECTORY_REGRESSION_THRESHOLD=0.05   # fire on 5%+ drops instead of 10%
+   ```
+5. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+## [0.35.6.0] - 2026-05-17
+
+**Your search results stop letting weak pages climb to the top just because they have a lot of links pointing at them.** Off by default; turn it on with one config key.
+
+Here's the problem this fixes. When your agent searches your brain, gbrain ranks pages by how well they match the query, then it gives a small bonus to pages that have lots of inbound links, pages you write about often, and pages you touched recently. Those bonuses are small individually. But on a big brain indexed with a strong embedding model (the kind shipped in v0.35.0.0 with ZeroEntropy zembed-1, or anyone running OpenAI text-embedding-3-large or Voyage 3+), the strong embedder treats "topically adjacent" content as more similar than it really is. So a page that barely matches your query still lands in the candidate pool, picks up all three bonuses, and ends up ranked higher than the page that actually answers your question.
+
+The fix is a "floor." When you turn it on, gbrain only gives the metadata bonuses to pages near the top of the result list. Pages way down the list (far from the best match) get NO bonus, no matter how popular or important they are by other measures. So a weak match stays weak. A strong match stays on top.
+
+Built on a community contribution from @jayzalowitz (he runs gbrain inside [SkyTwin](https://github.com/jayzalowitz/skytwin), a twin-memory layer, and noticed the bug on his own labeled test set). His PR was #1091. We did a deep review, found a few correctness bugs, refactored the shape, and shipped the integrated version. Full credit on the commit.
+
+### How to turn it on
+
+```bash
+# Try it on a single query first:
+gbrain query "..." --floor-ratio 0.85
+
+# Once you're happy, make it the default for every search:
+gbrain config set search.floor_ratio 0.85
+```
+
+`0.85` means "only boost pages that scored at least 85% as well as the best match." Good starting value if you're using a modern embedding model. Try `0.90` or `0.95` if you want the boost to apply to an even smaller head of the list. Values outside `0` to `1` are ignored, so a typo can't break your search.
+
+Off by default. We can't prove it helps on every brain (the original bug came from one specific test corpus), so we want you to opt in and tell us how it goes before we make it the default.
+
+### What you'd see in a concrete example
+
+Imagine you search "best meeting notes from Q1" and the brain returns:
+
+| Page | Match quality | Has many backlinks? | Without the floor | With the floor (0.85) |
+|---|---|---|---|---|
+| `meetings/q1-strategy-offsite` (the actual answer) | strong | no | bonus skipped, ranks lower | wins, ranks first |
+| `people/some-popular-person` (barely matches the query) | weak (0.5x of the top match) | yes, 1000 backlinks | huge bonus, leapfrogs the meeting note | no bonus (below the floor), stays where it should |
+
+That second row is the bug you've maybe been hitting if your brain has a few "celebrity" pages that everyone links to.
+
+### What's safe to know about
+
+Three things to keep in mind:
+
+- **Your search cache will dip for a few minutes after the upgrade, then recover.** gbrain caches recent search results to make repeat queries fast. We had to change the cache key shape so it can tell "floor on" results apart from "floor off" results. While both versions are running side by side during a deploy, the cache rebuilds. Clears itself within the cache TTL (default 1 hour).
+- **The gate only changes the three "metadata" bonuses (backlinks, salience, recency).** It does NOT change the exact-match bonus (when your query text literally appears in a page). Exact-match is a different kind of signal and stays on for everyone.
+- **No environment variable.** If you want to set this brain-wide, use `gbrain config set search.floor_ratio 0.85`. We deliberately did not add a `GBRAIN_SEARCH_FLOOR_RATIO` env var so `gbrain search modes` doesn't end up lying to you about what's actually configured.
+
+### What we caught and fixed before merging
+
+A second-opinion review (we sent the diff to a different AI for an adversarial read) caught three real bugs the original PR shipped with:
+
+- **Cache could serve stale "no-floor" results to a "with-floor" caller.** Same shape as a bug we fixed in v0.32.3 for the other search knobs. Closed.
+- **Pages with broken scores (NaN, comes up if an embedder version drift slipped through) would have skipped the floor and gotten boosted anyway.** Now they skip the boost entirely, which is the safer default.
+- **If your search returned only negative-score results (unusual but possible), the floor would have rejected its own top match.** Now it just turns off the floor in that case.
+
+We also reshaped two things from the original PR:
+
+- **The floor is now computed once per search, not three times.** The original recomputed it at each bonus stage, which meant the order the bonuses ran in subtly changed which pages got gated out. Now it's one number, applied the same way to all three.
+- **You can set it three ways instead of one.** Per-query (`--floor-ratio` flag), per-brain (config key, shown in `gbrain search modes`), or eventually per-mode bundle (the three search modes will get defaults once we have data on what works).
+
+### Itemized changes
+
+- `src/core/search/hybrid.ts` — three boost functions (`applyBacklinkBoost`, `applySalienceBoost`, `applyRecencyBoost`) gain an optional `floorThreshold?: number` parameter. Per-result loops now skip non-finite (NaN/Infinity) scores AND scores below the threshold. New exported `computeFloorThreshold(results, floorRatio)` is the single ratio→threshold converter; it returns `Number.NEGATIVE_INFINITY` (no gate) for undefined floorRatio, out-of-range values, or inputs with no positive signal. `runPostFusionStages` computes the threshold ONCE at entry and passes it uniformly to all three stages. `PostFusionOpts.floorRatio?: number` is the public-facing ratio.
+- `src/core/search/mode.ts` — `ModeBundle.floor_ratio: number | undefined`. All three bundles set `floor_ratio: undefined` initially. `SearchKeyOverrides` and `SearchPerCallOpts` gain `floor_ratio?: number`. `resolveSearchMode` picks via the standard chain. `loadOverridesFromConfig` parses `search.floor_ratio` (validates 0..1 range; out-of-range silently drops). `SEARCH_MODE_CONFIG_KEYS` includes `'search.floor_ratio'`. `KNOBS_HASH_VERSION` bumped 2→3; `knobsHash()` appends a `fr=<value-or-none>` segment at 4-decimal precision so 0.85, 0.851, and undefined all key into different rows.
+- `src/core/types.ts` — `SearchOpts.floorRatio?: number`.
+- `src/commands/search.ts` — `KNOB_DESCRIPTIONS` and the dashboard knob iteration include `floor_ratio`, so `gbrain search modes` and `gbrain search modes --json` surface the resolved value + source attribution alongside the other knobs.
+- `test/search.test.ts` — 30+ new cases covering `computeFloorThreshold` (out-of-range, NaN, negative top, all-NaN, single result), `applyBacklinkBoost` floor gate (preservation, weak-gated, borderline-eligible, leapfrog regression, NaN skip-not-pass), `applySalienceBoost` floor gate (T6 IRON RULE parity), `applyRecencyBoost` floor gate (T6 IRON RULE regression — the modified function shipped with zero test coverage on the new param), and `runPostFusionStages` single-baseline composition (D6 pin against future single-floor refactor).
+- `test/search-mode.test.ts` — `floor_ratio: undefined` added to the canonical-bundle fixtures for all three modes; `KNOBS_HASH_VERSION` pin updated to 3; new tests for `floor_ratio`-changes-hash (cache contamination prevention); `loadOverridesFromConfig` coverage for valid and out-of-range values.
+- `test/search/knobs-hash-reranker.test.ts` — header comment + version assertion updated for the 2→3 bump.
+
+### What's NOT in scope (deferred)
+
+- **Default-on for any mode.** `MODE_BUNDLES.floor_ratio` stays `undefined` for conservative / balanced / tokenmax until per-corpus ablation against gbrain's own eval surfaces (`longmemeval`, `whoknows`, `suspected-contradictions`, BrainBench-Real) backs a default flip. See `TODOS.md`.
+- **Per-stage floor ratios.** Single ratio applied uniformly to all three stages today. Different ratio per stage (different floor for salience vs recency) is v0.36+ if evidence shows asymmetric value.
+- **Per-source floor.** Single global threshold today. Federated-read users (v0.34.1.0+) sharing a query across multiple sources get one floor across the merged result set. v0.36+ if real federated-read usage shows the suppression issue codex flagged.
+- **Exact-match boost gating.** Explicit scope narrowing — exact-match is a lexical signal, different in kind from metadata boosts.
+- **`GBRAIN_SEARCH_FLOOR_RATIO` env var.** Would create a hidden side door `resolveSearchMode()` can't see. Use the config key instead.
+
+### For contributors
+
+- Plan + cross-model review trail: `~/.claude/plans/swift-sniffing-nygaard.md` captures the 9-decision (D1-D9) review pass through `/plan-eng-review` and `/codex`. Three correctness bugs (cache contamination, NaN passes gate, negative-top breaks single-result) were caught by codex's outside voice; two prior eng-review recommendations (per-stage composition lock, env var) were reversed before implementation. Reading the plan is the fastest way to understand which architectural decisions are durable vs accidental.
+- Community PR attribution: @jayzalowitz (PR #1091, SkyTwin twin-memory layer). The empirical motivation, the failure-mode framing, the dense-embedder targeting, and the `0.85` starting value are all from his ablation. Integration shape is gbrain-side.
+
+## To take advantage of v0.35.6.0
+
+`gbrain upgrade` should do this automatically. If it didn't:
+
+1. **Run the orchestrator manually** (no-op if migrations already at HEAD; the knobsHash bump is a code-level constant, not a DB schema change):
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the new knob is wired:**
+   ```bash
+   gbrain search modes --json | grep -A 1 floor_ratio
+   ```
+   Should show `"floor_ratio"` in the resolved knob map with `value: null` (no override set).
+3. **Try the gate on a corpus you suspect of leapfrog regressions:**
+   ```bash
+   # Compare results with and without the gate; if your dense-embedder corpus
+   # exhibits the failure mode, gate=0.85 should restore the strong primary.
+   gbrain query "..." --floor-ratio 0.85
+   ```
+4. **If `gbrain doctor` flags any new sync_failures or schema warnings post-upgrade,** the floor-ratio path is not the cause (no schema change in this release). File the issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output.
 
 ## [0.35.5.1] - 2026-05-16
 

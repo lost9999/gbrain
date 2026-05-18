@@ -591,6 +591,15 @@ export interface SearchOpts {
     rerankerFn?: (input: { query: string; documents: string[]; topN?: number; model?: string; signal?: AbortSignal; timeoutMs?: number }) => Promise<{ index: number; relevanceScore: number }[]>;
   };
   /**
+   * v0.35.6.0 — floor-ratio gate for metadata-axis boost stages.
+   * Number in [0, 1] or undefined (default = no gate). When set, each gated
+   * stage skips results whose pre-boost score is below `floorRatio * topScore`.
+   * Same threshold gates all three metadata stages; exact-match boost runs
+   * independently. Out-of-range values silently disable the gate.
+   * Sensible operator overrides for dense-embedder corpora: 0.85-0.95.
+   */
+  floorRatio?: number;
+  /**
    * v0.36 cross-modal wave: route this search through the multimodal
    * embedding space (Voyage multimodal-3 by default).
    *
