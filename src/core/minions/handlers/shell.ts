@@ -30,7 +30,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import type { MinionJobContext } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
-import { INHERITABLE, type InheritableSecret } from './shell-inherit.ts';
+import { deriveEnvKey, resolveInheritValue } from './shell-inherit.ts';
 import { validateShellJobParams } from './shell-validate.ts';
 import { loadConfig } from '../../config.ts';
 
@@ -61,15 +61,17 @@ export interface ShellJobParams {
    *  use `inherit:` instead. Enforced pre-enqueue by `validateShellJobParams`. */
   env?: Record<string, string>;
   /**
-   * Named secrets to inherit from the worker's `loadConfig()` into the child env
-   * (v0.35.8.0). Closed enum — only names declared in `INHERITABLE` are accepted.
-   * The worker resolves each name at child-spawn time and injects under the
-   * corresponding `envKey`. Names (not values) persist in `minion_jobs.data` and
-   * the shell-audit JSONL. The validator runs pre-enqueue in both submit paths
-   * so a bad payload never lands in the DB row. See:
+   * Free-form list of config-key names to inherit from the worker's
+   * `loadConfig()` into the child env (v0.36.5.0). Each name must match
+   * `[a-z][a-z0-9_]*`; the env key is derived via `deriveEnvKey` (e.g.
+   * `database_url` → `GBRAIN_DATABASE_URL`, `anthropic_api_key` →
+   * `ANTHROPIC_API_KEY`). Names persist to `minion_jobs.data` + the
+   * shell-audit JSONL; values resolve at child-spawn time and never persist
+   * anywhere from `inherit:` itself. Pre-enqueue validation fail-fasts when
+   * the worker can't resolve a requested name. See:
    * `src/core/minions/handlers/shell-inherit.ts` and `shell-validate.ts`.
    */
-  inherit?: InheritableSecret[];
+  inherit?: string[];
 }
 
 export interface ShellJobResult {
@@ -82,20 +84,21 @@ export interface ShellJobResult {
 
 /** Build the child process env. Layering (low to high precedence):
  *   1. `SHELL_ENV_ALLOWLIST` picked from `process.env` (worker process env).
- *   2. Resolved `inherit:` secrets — each name maps to its `envKey` via the
- *      `INHERITABLE` record, value comes from `loadConfig()`. Skipped silently
- *      here if a value is missing; pre-enqueue validation already fail-fasted
- *      on that, so we only reach this branch when every name resolves.
- *   3. Caller-supplied `job.data.env` (cannot contain secret env keys; the
- *      pre-enqueue validator rejects those).
+ *   2. Resolved `inherit:` values — each config-key name is looked up on the
+ *      worker's `loadConfig()`. The child-env key is derived via
+ *      `deriveEnvKey` (e.g. `database_url` → `GBRAIN_DATABASE_URL`).
+ *      Pre-enqueue validation fail-fasted on missing names, so we reach this
+ *      branch only when every name resolves.
+ *   3. Caller-supplied `job.data.env` overlay (free-form; trust model is
+ *      same-uid agent + worker, so the agent decides what to pass).
  *
- *  The trust boundary remains the operator's choice of `cwd`. Secret resolution
- *  goes through the closed `INHERITABLE` enum so a forged `inherit` name can't
- *  pivot to reading arbitrary config keys.
+ *  Trust boundary is the operator's choice of `cwd`. Resolution uses
+ *  `Object.hasOwn` (see `resolveInheritValue`) so prototype-pollution lookups
+ *  like `inherit:["__proto__"]` can't return a value.
  */
 function buildChildEnv(
   override: Record<string, string> | undefined,
-  inherit: InheritableSecret[] | undefined,
+  inherit: string[] | undefined,
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const key of SHELL_ENV_ALLOWLIST) {
@@ -105,15 +108,15 @@ function buildChildEnv(
   if (inherit && inherit.length > 0) {
     const cfg = loadConfig();
     for (const name of inherit) {
-      const value = INHERITABLE[name].read(cfg);
-      if (typeof value === 'string' && value.length > 0) {
-        env[INHERITABLE[name].envKey] = value;
+      const value = resolveInheritValue(cfg, name);
+      if (value !== undefined) {
+        env[deriveEnvKey(name)] = value;
       }
       // Missing values are not silently dropped in production — the
       // pre-enqueue validator fail-fasts at submit time. This branch only
-      // hits in legacy / pre-v0.35.8.0 rows that bypassed pre-enqueue
-      // validation; the defense-in-depth re-validation in shellHandler
-      // catches them before this code path runs in practice.
+      // hits in legacy rows that bypassed pre-enqueue validation; the
+      // defense-in-depth re-validation in shellHandler catches them before
+      // this code path runs in practice.
     }
   }
   if (override) {

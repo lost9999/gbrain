@@ -168,42 +168,56 @@ describe('E2E: Minions shell handler on PGLite (--follow inline path)', () => {
     }
   }, 30000);
 
-  test('v0.35.8.0: defense-in-depth — pre-existing row with env:{GBRAIN_DATABASE_URL} is rejected by handler revalidation', async () => {
-    // T1 defense-in-depth: even if a pre-v0.35.8.0 row sneaks past pre-enqueue
-    // validation (or a future submit path bypasses it), the handler re-runs
-    // the same validator at pickup and refuses to spawn the child.
+  test('v0.36.5.0: inherit:["anthropic_api_key"] also resolves (free-form, any config key)', async () => {
+    // v0.36.5.0 free-form design: inherit accepts ANY snake_case config-key
+    // name, not a closed enum. Same single-uid trust model — the agent
+    // decides what to pass. This test exercises the non-database_url path
+    // to prove the mechanism is genuinely free-form.
     const { writeFileSync, mkdirSync, rmSync, existsSync } = await import('node:fs');
     const { join } = await import('node:path');
     const { tmpdir } = await import('node:os');
 
-    const tmpHome = join(tmpdir(), `gbrain-did-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const tmpHome = join(tmpdir(), `gbrain-anth-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(join(tmpHome, '.gbrain'), { recursive: true });
+    const fakeKey = 'sk-ant-test-FAKE-KEY-FOR-E2E';
     writeFileSync(
       join(tmpHome, '.gbrain', 'config.json'),
-      JSON.stringify({ engine: 'postgres', database_url: 'postgresql://x:y@h:5432/d' }) + '\n',
+      JSON.stringify({
+        engine: 'postgres',
+        database_url: 'postgresql://x:y@h/d',
+        anthropic_api_key: fakeKey,
+      }) + '\n',
     );
 
     const savedHome = process.env.GBRAIN_HOME;
+    const savedAnth = process.env.ANTHROPIC_API_KEY;
     process.env.GBRAIN_HOME = tmpHome;
+    delete process.env.ANTHROPIC_API_KEY;
 
     try {
       const queue = new MinionQueue(engine);
-      // Submit directly via queue.add to bypass the CLI pre-enqueue validator,
-      // simulating a pre-v0.35.8.0 row or a future submit path that skips it.
       const job = await queue.add(
         'shell',
-        { cmd: 'echo bad', cwd: '/tmp', env: { GBRAIN_DATABASE_URL: 'postgresql://attacker:leaked@evil:5432/db' } },
+        { cmd: 'printenv ANTHROPIC_API_KEY', cwd: '/tmp', inherit: ['anthropic_api_key'] },
         {},
         { allowProtectedSubmit: true },
       );
+
+      // Row carries name only — not value.
+      const persisted = await queue.getJob(job.id);
+      expect((persisted!.data as Record<string, unknown>).inherit).toEqual(['anthropic_api_key']);
+      const rowJson = JSON.stringify(persisted!.data);
+      expect(rowJson).not.toContain('sk-ant-test-FAKE-KEY-FOR-E2E');
 
       const worker = new MinionWorker(engine, { pollInterval: 100, lockDuration: 30000 });
       await registerBuiltinHandlers(worker, engine);
       const runPromise = worker.start();
       try {
-        // Handler revalidation must reject this row. UnrecoverableError → dead.
         const status = await waitTerminal(queue, job.id, 20000);
-        expect(['dead', 'failed']).toContain(status);
+        expect(status).toBe('completed');
+        const final = await queue.getJob(job.id);
+        // Child saw ANTHROPIC_API_KEY = configured key (derived env-name from snake_case)
+        expect((final!.result as Record<string, unknown>).stdout_tail).toBe(fakeKey + '\n');
       } finally {
         worker.stop();
         await runPromise;
@@ -211,6 +225,8 @@ describe('E2E: Minions shell handler on PGLite (--follow inline path)', () => {
     } finally {
       if (savedHome === undefined) delete process.env.GBRAIN_HOME;
       else process.env.GBRAIN_HOME = savedHome;
+      if (savedAnth === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = savedAnth;
       if (existsSync(tmpHome)) rmSync(tmpHome, { recursive: true, force: true });
     }
   }, 30000);

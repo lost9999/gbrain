@@ -152,24 +152,29 @@ proxy for worker env.
 | `autopilot` | Run as a daemon directly on the host | Long-lived, not job-shaped. |
 | `init` / `secrets` | One-time host setup | Operator action, not agent action. |
 
-## What never to do
+## Recommended patterns
 
-- **Never write secrets into `env:` per-job.** Use `inherit:` instead. The
-  validator rejects it at pre-enqueue starting v0.36.5.0.
-- **Never recommend "just put `database_url` in `~/.gbrain/config.json`"** as
-  a way for the agent to set up gbrain. That's the operator's responsibility,
-  done once at host setup. The agent should assume it's there and use
-  `inherit:`.
+- **Prefer `inherit:` for secrets you don't want in the row.** Names land in
+  `minion_jobs.data`; values resolve at child-spawn from the worker's config.
+  If a brain DB ever traverses a trust boundary, secrets stay out.
+- **Free-form names.** `inherit:` accepts any snake_case config-key on your
+  worker — `database_url`, `anthropic_api_key`, `openai_api_key`,
+  `voyage_api_key`, `groq_api_key`, `zeroentropy_api_key`, or any custom
+  field you stuff into `~/.gbrain/config.json`. The agent picks what it
+  needs.
+- **`env:` still works** for non-secret values, or for cases where you
+  WANT the value in the row (e.g. an opaque correlation token your audit
+  flow needs to read back later). The validator doesn't second-guess you.
 - **Never try to route a `localOnly` op through thin-client MCP.** It will
   fail with `localOnly op refused in thin-client mode`. Use shell-job +
-  `inherit:`.
+  `inherit:` (for secrets) or `env:` (for non-secrets).
 
 ## Migration: from pre-v0.36.5.0
 
-If your agent submits shell jobs like this:
+If your agent submits shell jobs that pass secrets via `env:`:
 
 ```jsonc
-// Pre-v0.36.5.0 — REJECTED at submit time as of v0.36.5.0:
+// Pre-v0.36.5.0: works but URL persists in minion_jobs.data plaintext.
 {
   "cmd": "gbrain sync --skip-failed",
   "cwd": "/data/gbrain",
@@ -177,10 +182,10 @@ If your agent submits shell jobs like this:
 }
 ```
 
-Switch to:
+Switch to (recommended):
 
 ```jsonc
-// v0.36.5.0+:
+// v0.36.5.0+: name in row, value resolved at child-spawn from worker config.
 {
   "cmd": "gbrain sync --skip-failed",
   "cwd": "/data/gbrain",

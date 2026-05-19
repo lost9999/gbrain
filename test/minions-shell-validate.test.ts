@@ -1,23 +1,33 @@
 /**
  * Tests for `src/core/minions/handlers/shell-validate.ts` — the pre-enqueue
- * validator that closes the load-bearing R1 bug.
+ * validator.
  *
- * The bug class these tests pin (codex F-CDX-1): pre-v0.35.8.0, shell-job
- * validation ran in the worker handler, AFTER `MinionQueue.add()` had already
- * persisted `data` to the `minion_jobs` row. So a bad payload (env: shadowing
- * a secret, unknown inherit name) lived in the DB row from submit-time until
- * handler-pickup. Test #3 (the regression guard) pins the invariant:
- * validation throws BEFORE any `queue.add` spy fires.
+ * v0.36.5.0 design: `inherit:` is free-form (any snake_case config-key name).
+ * No closed-enum check, no env-shadow rejection, no inline-cmd scan. The
+ * single-uid trust model treats the agent as a peer of the worker — it
+ * decides which secrets to pass.
+ *
+ * What the validator DOES check:
+ *   - Shape (cmd XOR argv, cwd absolute, env is string→string)
+ *   - `inherit` is array of snake_case strings (prototype-pollution defense)
+ *   - Every `inherit` name resolves on `loadConfig()` (UX fail-fast)
+ *
+ * The T1 regression guard at the bottom pins the load-bearing invariant:
+ * validation throws BEFORE any persistence call.
  */
 
 import { describe, test, expect } from 'bun:test';
 import { validateShellJobParams } from '../src/core/minions/handlers/shell-validate.ts';
-import { INHERITABLE_NAMES, ALL_SHADOW_KEYS } from '../src/core/minions/handlers/shell-inherit.ts';
 import { UnrecoverableError } from '../src/core/minions/types.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
 const dbUrl = 'postgresql://test:test@localhost:5432/test';
-const fakeCfg: GBrainConfig = { engine: 'postgres', database_url: dbUrl };
+const fakeCfg: GBrainConfig = {
+  engine: 'postgres',
+  database_url: dbUrl,
+  anthropic_api_key: 'sk-ant-test',
+  openai_api_key: 'sk-test',
+};
 
 describe('validateShellJobParams — existing param shape checks', () => {
   test('cmd XOR argv: both → reject', () => {
@@ -50,79 +60,83 @@ describe('validateShellJobParams — existing param shape checks', () => {
   });
 });
 
-describe('validateShellJobParams — inherit validation', () => {
-  test('unknown inherit name → reject with allowed list in message', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', inherit: ['not_a_real_key'] },
-      { config: fakeCfg },
-    )).toThrow(/unknown name|allowed:/);
-  });
-  test('inherit must be array, not string', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', inherit: 'database_url' as unknown as string[] },
-      { config: fakeCfg },
-    )).toThrow(/inherit must be an array/);
-  });
-  test('inherit non-string element → reject', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', inherit: [1] as unknown as string[] },
-      { config: fakeCfg },
-    )).toThrow(/unknown name/);
-  });
-  test('inherit:["database_url"] accepted when config has database_url', () => {
+describe('inherit — free-form config-key names (v0.36.5.0)', () => {
+  test('inherit:["database_url"] accepted', () => {
     const p = validateShellJobParams(
       { cmd: 'echo', cwd: '/tmp', inherit: ['database_url'] },
       { config: fakeCfg },
     );
     expect(p.inherit).toEqual(['database_url']);
   });
-  test('INHERITABLE_NAMES contains database_url and nothing scope-creep in v0.35.8.0', () => {
-    // T2 decision lock: scope is database_url ONLY in v0.35.8.0. Adding
-    // API keys here without doing the GBrainConfig + buildGatewayConfig
-    // refactor is the scope creep codex flagged.
-    expect(INHERITABLE_NAMES).toEqual(['database_url']);
-  });
-});
-
-describe('validateShellJobParams — T3 env-shadow rejection', () => {
-  test('env:{GBRAIN_DATABASE_URL} alone (without inherit) → reject', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', env: { GBRAIN_DATABASE_URL: dbUrl } },
-      { config: fakeCfg },
-    )).toThrow(/env GBRAIN_DATABASE_URL is a secret/);
-  });
-  test('env:{DATABASE_URL} alone (alt shadow key) → reject', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', env: { DATABASE_URL: dbUrl } },
-      { config: fakeCfg },
-    )).toThrow(/env DATABASE_URL is a secret/);
-  });
-  test('shadow message points at the right inherit name', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', env: { GBRAIN_DATABASE_URL: dbUrl } },
-      { config: fakeCfg },
-    )).toThrow(/inherit:\s*\["database_url"\]/);
-  });
-  test('inherit + env-shadow → reject with explicit shadow message', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', inherit: ['database_url'], env: { GBRAIN_DATABASE_URL: dbUrl } },
-      { config: fakeCfg },
-    )).toThrow(/shadows inherit\["database_url"\]/);
-  });
-  test('ALL_SHADOW_KEYS contains both GBRAIN_DATABASE_URL and DATABASE_URL', () => {
-    expect(ALL_SHADOW_KEYS.has('GBRAIN_DATABASE_URL')).toBe(true);
-    expect(ALL_SHADOW_KEYS.has('DATABASE_URL')).toBe(true);
-  });
-  test('non-secret env keys still allowed', () => {
+  test('inherit:["anthropic_api_key"] accepted (was scope-creep in closed enum)', () => {
     const p = validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', env: { MY_FLAG: '1', SOME_TOKEN: 'public' } },
+      { cmd: 'echo', cwd: '/tmp', inherit: ['anthropic_api_key'] },
       { config: fakeCfg },
     );
-    expect(p.env).toEqual({ MY_FLAG: '1', SOME_TOKEN: 'public' });
+    expect(p.inherit).toEqual(['anthropic_api_key']);
+  });
+  test('inherit multiple keys at once', () => {
+    const p = validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: ['database_url', 'anthropic_api_key', 'openai_api_key'] },
+      { config: fakeCfg },
+    );
+    expect(p.inherit).toEqual(['database_url', 'anthropic_api_key', 'openai_api_key']);
+  });
+  test('inherit must be an array', () => {
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: 'database_url' as unknown as string[] },
+      { config: fakeCfg },
+    )).toThrow(/inherit must be an array/);
+  });
+  test('inherit non-string element rejected', () => {
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: [1] as unknown as string[] },
+      { config: fakeCfg },
+    )).toThrow(/non-empty strings/);
+  });
+  test('inherit empty string rejected', () => {
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: [''] },
+      { config: fakeCfg },
+    )).toThrow(/non-empty strings/);
   });
 });
 
-describe('validateShellJobParams — F1 fail-fast on missing config', () => {
+describe('inherit — snake_case shape guard (prototype-pollution defense)', () => {
+  test('"__proto__" rejected (not snake_case shape)', () => {
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: ['__proto__'] },
+      { config: fakeCfg },
+    )).toThrow(/must match \[a-z\]/);
+  });
+  test('"constructor" rejected (uppercase letters)', () => {
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: ['constructor'] as unknown as string[] },
+      { config: fakeCfg },
+    )).toThrow(/worker has no constructor configured/);
+  });
+  test('path-traversal-looking name rejected', () => {
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: ['../etc/passwd'] },
+      { config: fakeCfg },
+    )).toThrow(/must match \[a-z\]/);
+  });
+  test('"FOO_BAR" (uppercase) rejected — config keys are snake_case', () => {
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: ['FOO_BAR'] },
+      { config: fakeCfg },
+    )).toThrow(/must match \[a-z\]/);
+  });
+  test('digits-after-letter allowed (matches regex)', () => {
+    // Won't actually resolve since fakeCfg doesn't have field2 — fail-fast hits
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: ['field2'] },
+      { config: fakeCfg },
+    )).toThrow(/worker has no field2 configured/);
+  });
+});
+
+describe('inherit — fail-fast on missing config value', () => {
   test('inherit:["database_url"] + config without database_url → reject with set-hint', () => {
     expect(() => validateShellJobParams(
       { cmd: 'echo', cwd: '/tmp', inherit: ['database_url'] },
@@ -135,6 +149,12 @@ describe('validateShellJobParams — F1 fail-fast on missing config', () => {
       { config: null },
     )).toThrow(/worker has no database_url/);
   });
+  test('inherit:["voyage_api_key"] when not set → reject (fakeCfg has only db_url + anthropic + openai)', () => {
+    expect(() => validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: ['voyage_api_key'] },
+      { config: fakeCfg },
+    )).toThrow(/worker has no voyage_api_key configured/);
+  });
   test('inherit:["database_url"] + empty-string database_url → reject', () => {
     expect(() => validateShellJobParams(
       { cmd: 'echo', cwd: '/tmp', inherit: ['database_url'] },
@@ -143,75 +163,47 @@ describe('validateShellJobParams — F1 fail-fast on missing config', () => {
   });
 });
 
-describe('H1 (codex v0.36.5.0): cmd/argv inline-secret scan', () => {
-  test('cmd:"GBRAIN_DATABASE_URL=... gbrain sync" → reject', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'GBRAIN_DATABASE_URL=postgresql://x:y@h/d gbrain sync', cwd: '/tmp' },
-      { config: fakeCfg },
-    )).toThrow(/cmd contains inline secret assignment/);
-  });
-  test('cmd:"DATABASE_URL=..." → reject', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'DATABASE_URL=postgresql://x:y@h/d gbrain sync', cwd: '/tmp' },
-      { config: fakeCfg },
-    )).toThrow(/cmd contains inline secret assignment/);
-  });
-  test('cmd with shadow-key after semicolon → reject', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo hi; GBRAIN_DATABASE_URL=postgresql://x:y@h/d gbrain sync', cwd: '/tmp' },
-      { config: fakeCfg },
-    )).toThrow(/cmd contains inline secret assignment/);
-  });
-  test('argv carrying shadow-key assignment → reject', () => {
-    expect(() => validateShellJobParams(
-      { argv: ['env', 'GBRAIN_DATABASE_URL=postgresql://x:y@h/d', 'gbrain', 'sync'], cwd: '/tmp' },
-      { config: fakeCfg },
-    )).toThrow(/argv contains inline secret assignment/);
-  });
-  test('non-secret env var inline in cmd is allowed', () => {
+describe('what the validator deliberately does NOT do (agency for the agent)', () => {
+  test('caller can use env: for ANY key, including ones with secret-looking names', () => {
+    // No shadow rejection. Agent decides if they want to put a URL in env:
+    // directly (and accept that it lands in the row plaintext). v0.36.5.0
+    // honors the agent's call.
     const p = validateShellJobParams(
-      { cmd: 'MY_FLAG=1 PUBLIC_TOKEN=xyz echo hi', cwd: '/tmp' },
+      { cmd: 'echo', cwd: '/tmp', env: { GBRAIN_DATABASE_URL: dbUrl, DATABASE_URL: dbUrl } },
       { config: fakeCfg },
     );
-    expect(p.cmd).toContain('MY_FLAG=1');
+    expect(p.env).toEqual({ GBRAIN_DATABASE_URL: dbUrl, DATABASE_URL: dbUrl });
   });
-  test('cmd hint points at inherit when match is a known shadow key', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'GBRAIN_DATABASE_URL=postgresql://x:y@h/d gbrain sync', cwd: '/tmp' },
+  test('caller can put inline secret-key=value in cmd', () => {
+    // No inline-cmd scan. The agent knows what it's writing.
+    const p = validateShellJobParams(
+      { cmd: 'GBRAIN_DATABASE_URL=postgresql://... gbrain sync', cwd: '/tmp' },
       { config: fakeCfg },
-    )).toThrow(/inherit:\s*\["database_url"\]/);
+    );
+    expect(p.cmd).toContain('GBRAIN_DATABASE_URL');
   });
-});
-
-describe('H3 (codex v0.36.5.0): GBRAIN_DIRECT_DATABASE_URL in shadowKeys', () => {
-  test('env:{GBRAIN_DIRECT_DATABASE_URL} → reject', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'echo', cwd: '/tmp', env: { GBRAIN_DIRECT_DATABASE_URL: 'postgresql://...' } },
+  test('inherit + env: with overlapping intent both work (last write wins per overlay order)', () => {
+    // Agent might want inherit for value-from-config AND env: for an
+    // additional non-secret. Both are honored.
+    const p = validateShellJobParams(
+      { cmd: 'echo', cwd: '/tmp', inherit: ['database_url'], env: { MY_FLAG: '1' } },
       { config: fakeCfg },
-    )).toThrow(/GBRAIN_DIRECT_DATABASE_URL is a secret/);
-  });
-  test('cmd:"GBRAIN_DIRECT_DATABASE_URL=..." → reject (inline scan covers all three names)', () => {
-    expect(() => validateShellJobParams(
-      { cmd: 'GBRAIN_DIRECT_DATABASE_URL=postgresql://x gbrain sync', cwd: '/tmp' },
-      { config: fakeCfg },
-    )).toThrow(/cmd contains inline secret assignment/);
+    );
+    expect(p.inherit).toEqual(['database_url']);
+    expect(p.env).toEqual({ MY_FLAG: '1' });
   });
 });
 
 describe('T1 regression guard: validation runs BEFORE persistence', () => {
   // This test pins the load-bearing invariant codex caught: validation must
   // throw before any persistence call. If a future refactor moves the
-  // validation call back into the shell.ts handler, this test fails — the
-  // spy fires before the throw and the assertion order proves the bug
-  // reintroduced.
+  // validation call back into the shell.ts handler, this test fails.
   test('bad payload throws synchronously, no queue.add could have been called', () => {
     let queueAddCalled = false;
     const fakeQueueAdd = () => { queueAddCalled = true; };
 
-    // Simulate the canonical CLI submit-flow ordering:
-    //   try { validateShellJobParams(data); } catch { exit; }
-    //   fakeQueueAdd();
-    const data = { cmd: 'echo', cwd: '/tmp', env: { GBRAIN_DATABASE_URL: dbUrl } };
+    // Bad shape: inherit name doesn't pass snake_case regex.
+    const data = { cmd: 'echo', cwd: '/tmp', inherit: ['NotSnake'] };
     let validatorThrew = false;
     try {
       validateShellJobParams(data, { config: fakeCfg });

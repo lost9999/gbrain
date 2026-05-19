@@ -1,98 +1,120 @@
 /**
- * Tests for `src/core/minions/handlers/shell-inherit.ts` — the single source
- * of truth for inheritable shell-job secrets.
+ * Tests for `src/core/minions/handlers/shell-inherit.ts` — free-form helpers
+ * for `inherit:` secret resolution (v0.36.5.0).
  *
- * Goal: pin behavior, not shape. Codex F-CDX-7 critiqued the original test
- * plan for asserting "the array is exported" — that's shape-coupled and
- * tells you nothing if a contributor adds an array member but forgets the
- * resolver. These tests verify each INHERITABLE entry's resolver actually
- * reads the right config field AND its shadow-key set is consistent.
+ * Two pure functions and one regex. Properties under test:
+ *   - `INHERIT_NAME_RE` matches snake_case shapes, rejects everything else.
+ *   - `deriveEnvKey` returns the right ENV-key name per convention.
+ *   - `resolveInheritValue` uses `Object.hasOwn` (prototype-pollution defense),
+ *     returns undefined for missing / non-string / empty-string values, and
+ *     handles `null` config.
  */
 
 import { describe, test, expect } from 'bun:test';
 import {
-  INHERITABLE,
-  INHERITABLE_NAMES,
-  ALL_SHADOW_KEYS,
-  inheritedByShadowKey,
-  isInheritableSecret,
+  INHERIT_NAME_RE,
+  deriveEnvKey,
+  resolveInheritValue,
 } from '../src/core/minions/handlers/shell-inherit.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
-describe('INHERITABLE record', () => {
-  test('database_url.read returns config.database_url', () => {
-    const url = 'postgresql://x:y@host:5432/db';
-    const cfg: GBrainConfig = { engine: 'postgres', database_url: url };
-    expect(INHERITABLE.database_url.read(cfg)).toBe(url);
+describe('INHERIT_NAME_RE', () => {
+  test.each([
+    'database_url',
+    'anthropic_api_key',
+    'openai_api_key',
+    'voyage_api_key',
+    'groq_api_key',
+    'zeroentropy_api_key',
+    'remote_mcp_oauth_client_secret',
+    'field2',
+    'a',
+    'a_b_c_d_e',
+  ])('accepts snake_case shape: %s', (name) => {
+    expect(INHERIT_NAME_RE.test(name)).toBe(true);
   });
 
-  test('database_url.read returns undefined when config has no database_url', () => {
-    expect(INHERITABLE.database_url.read({ engine: 'postgres' })).toBeUndefined();
-  });
-
-  test('database_url.read returns undefined for null config', () => {
-    expect(INHERITABLE.database_url.read(null)).toBeUndefined();
-  });
-
-  test('every entry has a non-empty envKey + at least one shadowKey + a read fn', () => {
-    for (const name of INHERITABLE_NAMES) {
-      const spec = INHERITABLE[name];
-      expect(typeof spec.envKey).toBe('string');
-      expect(spec.envKey.length).toBeGreaterThan(0);
-      expect(spec.shadowKeys.length).toBeGreaterThanOrEqual(1);
-      expect(typeof spec.read).toBe('function');
-    }
-  });
-
-  test('every entry: envKey is in its own shadowKeys (you cannot put the same env key in env: and inherit)', () => {
-    for (const name of INHERITABLE_NAMES) {
-      const spec = INHERITABLE[name];
-      expect((spec.shadowKeys as readonly string[]).includes(spec.envKey)).toBe(true);
-    }
+  test.each([
+    '__proto__',           // leading underscore (prototype pollution)
+    '_underscore_first',   // leading underscore
+    'CamelCase',           // uppercase letters
+    'UPPER_CASE',          // all uppercase
+    '0_leading_digit',     // leading digit
+    'has-dash',            // hyphen
+    'has.dot',             // dot
+    '../traversal',        // path-traversal shape
+    'has space',           // whitespace
+    '',                    // empty
+    'has\nnewline',        // newline
+  ])('rejects non-snake_case shape: %s', (name) => {
+    expect(INHERIT_NAME_RE.test(name)).toBe(false);
   });
 });
 
-describe('inheritedByShadowKey', () => {
-  test('GBRAIN_DATABASE_URL → database_url', () => {
-    expect(inheritedByShadowKey('GBRAIN_DATABASE_URL')).toBe('database_url');
+describe('deriveEnvKey', () => {
+  test('database_url → GBRAIN_DATABASE_URL (override, less ambiguous)', () => {
+    expect(deriveEnvKey('database_url')).toBe('GBRAIN_DATABASE_URL');
   });
-  test('DATABASE_URL → database_url', () => {
-    expect(inheritedByShadowKey('DATABASE_URL')).toBe('database_url');
+  test('anthropic_api_key → ANTHROPIC_API_KEY (provider-standard uppercase)', () => {
+    expect(deriveEnvKey('anthropic_api_key')).toBe('ANTHROPIC_API_KEY');
   });
-  test('unknown env key → undefined', () => {
-    expect(inheritedByShadowKey('MY_RANDOM_VAR')).toBeUndefined();
+  test('openai_api_key → OPENAI_API_KEY', () => {
+    expect(deriveEnvKey('openai_api_key')).toBe('OPENAI_API_KEY');
   });
-});
-
-describe('isInheritableSecret type guard', () => {
-  test('accepts known name', () => {
-    expect(isInheritableSecret('database_url')).toBe(true);
+  test('voyage_api_key → VOYAGE_API_KEY', () => {
+    expect(deriveEnvKey('voyage_api_key')).toBe('VOYAGE_API_KEY');
   });
-  test('rejects unknown name', () => {
-    expect(isInheritableSecret('not_a_secret')).toBe(false);
+  test('groq_api_key → GROQ_API_KEY', () => {
+    expect(deriveEnvKey('groq_api_key')).toBe('GROQ_API_KEY');
   });
-  test('rejects non-string', () => {
-    expect(isInheritableSecret(1)).toBe(false);
-    expect(isInheritableSecret(null)).toBe(false);
-    expect(isInheritableSecret(undefined)).toBe(false);
+  test('arbitrary_field → ARBITRARY_FIELD (default uppercase)', () => {
+    expect(deriveEnvKey('arbitrary_field')).toBe('ARBITRARY_FIELD');
   });
 });
 
-describe('ALL_SHADOW_KEYS', () => {
-  test('contains every shadowKey from every entry', () => {
-    for (const name of INHERITABLE_NAMES) {
-      for (const sk of INHERITABLE[name].shadowKeys) {
-        expect(ALL_SHADOW_KEYS.has(sk)).toBe(true);
-      }
-    }
+describe('resolveInheritValue', () => {
+  test('returns string when field exists and is a non-empty string', () => {
+    const cfg: GBrainConfig = { engine: 'postgres', database_url: 'postgresql://x' };
+    expect(resolveInheritValue(cfg, 'database_url')).toBe('postgresql://x');
   });
-  test('no extra entries beyond what is declared', () => {
-    const declared = new Set<string>();
-    for (const name of INHERITABLE_NAMES) {
-      for (const sk of INHERITABLE[name].shadowKeys) {
-        declared.add(sk);
-      }
-    }
-    expect(ALL_SHADOW_KEYS.size).toBe(declared.size);
+  test('returns undefined when field is unset', () => {
+    expect(resolveInheritValue({ engine: 'postgres' }, 'database_url')).toBeUndefined();
+  });
+  test('returns undefined when field is empty string', () => {
+    const cfg: GBrainConfig = { engine: 'postgres', database_url: '' };
+    expect(resolveInheritValue(cfg, 'database_url')).toBeUndefined();
+  });
+  test('returns undefined for null config', () => {
+    expect(resolveInheritValue(null, 'database_url')).toBeUndefined();
+  });
+  test('returns undefined when field is non-string (e.g. object)', () => {
+    const cfg = { engine: 'postgres', remote_mcp: { issuer_url: 'x' } } as unknown as GBrainConfig;
+    expect(resolveInheritValue(cfg, 'remote_mcp')).toBeUndefined();
+  });
+  test('prototype-pollution defense: __proto__ returns undefined even though Object.prototype has the property', () => {
+    expect(resolveInheritValue({ engine: 'postgres' }, '__proto__')).toBeUndefined();
+  });
+  test('prototype-pollution defense: constructor returns undefined', () => {
+    expect(resolveInheritValue({ engine: 'postgres' }, 'constructor')).toBeUndefined();
+  });
+  test('prototype-pollution defense: toString returns undefined', () => {
+    expect(resolveInheritValue({ engine: 'postgres' }, 'toString')).toBeUndefined();
+  });
+});
+
+describe('integration: deriveEnvKey + resolveInheritValue work together', () => {
+  const cfg: GBrainConfig = {
+    engine: 'postgres',
+    database_url: 'postgresql://x',
+    anthropic_api_key: 'sk-ant-x',
+    openai_api_key: 'sk-x',
+  };
+  test.each([
+    ['database_url', 'GBRAIN_DATABASE_URL', 'postgresql://x'],
+    ['anthropic_api_key', 'ANTHROPIC_API_KEY', 'sk-ant-x'],
+    ['openai_api_key', 'OPENAI_API_KEY', 'sk-x'],
+  ])('name %s resolves to envKey %s with value %s', (name, expectedEnvKey, expectedValue) => {
+    expect(deriveEnvKey(name)).toBe(expectedEnvKey);
+    expect(resolveInheritValue(cfg, name)).toBe(expectedValue);
   });
 });

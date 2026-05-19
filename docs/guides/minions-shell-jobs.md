@@ -143,19 +143,31 @@ wrote things like:
 
 This planted plaintext secrets in `minion_jobs.data` (DB row) and in the
 shell-audit JSONL. Anyone with read access to the brain DB (or a brain dump,
-or a shared brain via the mounts feature) saw the URL. As of v0.36.5.0, both
-`GBRAIN_DATABASE_URL` and `DATABASE_URL` are rejected in `env:` at
-pre-enqueue validation with this exact error:
+or a shared brain via the mounts feature) saw the URL. v0.36.5.0 doesn't
+forbid that pattern — the validator trusts the agent — but **prefer
+`inherit:`** for any secret you want kept out of the row. Names land in the
+row; values resolve at child-spawn from the worker's config.
 
-```
-shell: env GBRAIN_DATABASE_URL is a secret — use `inherit: ["database_url"]` instead.
-```
+**Scope:** v0.36.5.0 `inherit:` is **free-form**. Pass any snake_case
+config-key name and the worker resolves the value from `loadConfig()` at
+child-spawn time:
 
-**Scope:** v0.36.5.0 supports `inherit: ["database_url"]` only. Anthropic /
-OpenAI / Groq / Voyage API keys are still expected to live in the worker's
-own env or config — provider keys are resolved by the worker's gateway at
-startup, not per-job. Shell jobs that call `gbrain` with `inherit:` rely on
-the same gateway-startup resolution for any LLM-touching subcommand.
+- `inherit: ["database_url"]` → child env `GBRAIN_DATABASE_URL`
+- `inherit: ["anthropic_api_key"]` → child env `ANTHROPIC_API_KEY`
+- `inherit: ["openai_api_key"]` → child env `OPENAI_API_KEY`
+- `inherit: ["voyage_api_key"]` → child env `VOYAGE_API_KEY`
+- `inherit: ["groq_api_key", "zeroentropy_api_key"]` → both injected
+- Or any arbitrary config-key your worker has (`my_custom_field` →
+  `MY_CUSTOM_FIELD`)
+
+The env-key name is derived by uppercasing the config-key name. The one
+override is `database_url` → `GBRAIN_DATABASE_URL` (plain `DATABASE_URL` is
+ambiguous in most Postgres-app contexts).
+
+Pre-enqueue validation fail-fasts if the worker can't resolve a requested
+name. The validator does NOT police which secrets you choose to inherit —
+the agent submitting the minion is in the same uid as the worker, so it's
+your call.
 
 **Honest scope — output-side leakage (read this).** The `inherit:` allowlist
 prevents secrets from landing in the JOB ROW INPUT fields (`data.cmd`,
@@ -232,10 +244,10 @@ gbrain jobs list --status waiting --name shell
 | `shell: cwd is required and must be an absolute path` | `cwd` must be a string starting with `/`. | Set `cwd` in `--params` to an absolute path. |
 | `shell: argv must be an array of strings` | `argv` has a non-string entry or isn't an array. | Pass `argv: ["bin","arg1","arg2"]`. |
 | `shell: env values must all be strings` | `env` has a number/bool/object value. | Stringify: `"env":{"COUNT":"3"}` not `"env":{"COUNT":3}`. |
-| `shell: env GBRAIN_DATABASE_URL is a secret` / `shell: env DATABASE_URL is a secret` | Caller put a secret directly in `env:`. Pre-v0.36.5.0 anti-pattern. | Switch to `"inherit": ["database_url"]` and remove the env entry. Worker resolves from its own config. See [Secrets](#secrets). |
-| `shell: inherit contains unknown name "<X>"` | Caller passed an inherit name not in the v0.36.5.0 closed enum. | Allowed names: `database_url`. Use one of these. |
-| `shell: inherit requested "X" but worker has no X configured` | Worker hasn't set the key the job asked it to resolve. | Run `gbrain config set X <value>` on the worker host. |
-| `shell: env X shadows inherit["X"]` | Caller passed BOTH `inherit:["X"]` AND `env:{shadow_key_of_X}`. Ambiguous. | Drop the `env:` key; let `inherit:` handle it. |
+| `shell: inherit must be an array of config-key names` | `inherit` wasn't an array. | Pass `"inherit": ["database_url", ...]`. |
+| `shell: inherit entries must be non-empty strings` | An element of `inherit` was empty, non-string, or null. | Use snake_case config-key names like `database_url`, `anthropic_api_key`. |
+| `shell: inherit name "<X>" must match [a-z][a-z0-9_]*` | Name failed snake_case regex (uppercase, leading digit/underscore, special char). | Use the config-key name verbatim — `database_url`, not `DATABASE_URL`. |
+| `shell: inherit requested "<X>" but worker has no <X> configured` | Worker can't resolve the requested name from `loadConfig()`. | Run `gbrain config set <X> <value>` on the worker host, OR check the config file at `~/.gbrain/config.json`. |
 | `permission_denied: shell jobs cannot be submitted over MCP` | An MCP client tried to submit a shell job. By design CLI-only. | Submit from CLI or via a trusted operation handler (`ctx.remote === false`). |
 | `protected job name 'shell' requires CLI or operation-local submitter` | A caller invoked `MinionQueue.add('shell', ...)` without the `trusted` opt-in. | Pass `{ allowProtectedSubmit: true }` as the 4th arg. CLI and `submit_job` do this automatically. |
 | `aborted: timeout` / `aborted: cancel` / `aborted: shutdown` / `aborted: lock-lost` | The worker's abort signal fired mid-execution. Child got SIGTERM, 5s grace, then SIGKILL. | Expected: timeout / user cancel / deploy restart / stall. Inspect `gbrain jobs get` to see which. |

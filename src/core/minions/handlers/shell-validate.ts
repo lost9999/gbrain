@@ -1,32 +1,37 @@
 /**
- * Pre-enqueue validator for `shell` job params (v0.35.8.0).
+ * Pre-enqueue validator for `shell` job params (v0.36.5.0).
  *
  * Called from BOTH submit surfaces BEFORE `MinionQueue.add()`:
  *   - `src/commands/jobs.ts` — `gbrain jobs submit shell` CLI handler
  *   - `src/core/operations.ts` — `submit_job` op handler for name='shell'
  *
- * Critical correctness property: a rejected payload NEVER lands in
- * `minion_jobs.data`. Validation in the worker handler (where it lived
- * pre-v0.35.8.0) ran AFTER `queue.add()` had already persisted the row, so
- * a bad payload (env: shadowing a secret, unknown inherit name) lived in
- * the DB row from submit-time until handler-pickup. This module exists
- * specifically to close that window. The handler still re-validates as
- * defense-in-depth.
+ * Correctness property: a rejected payload NEVER lands in `minion_jobs.data`.
+ * Pre-v0.36.5.0 validation ran in the worker handler AFTER `queue.add()` had
+ * already persisted the row; this module exists to close that window.
  *
- * Throws `UnrecoverableError` on every failure path — validation errors are
- * never retry-worthy. Errors carry paste-ready hints pointing at the right
- * pattern (e.g. `inherit:["database_url"]` instead of `env:{GBRAIN_DATABASE_URL}`).
+ * Trust model (read this once): the agent that submits the job is in the same
+ * uid as the worker that runs it. We do NOT police WHICH secrets the agent
+ * chooses to pass — that's the agent's call. We only validate:
+ *
+ *   1. Shape — `cmd` XOR `argv`, `cwd` absolute, `env` is string→string
+ *   2. `inherit` is an array of snake_case names (prevents prototype-pollution
+ *      lookups like `__proto__` and keeps audit logs readable)
+ *   3. Every `inherit` name resolves to a non-empty string on the worker's
+ *      `loadConfig()` (UX guardrail — fail at submit time, not minutes later
+ *      in opaque child-process stderr)
+ *
+ * What we deliberately do NOT do:
+ *   - No closed-enum allowlist of "approved" secrets. Agent decides.
+ *   - No shadow-rejection (caller can also set the same key in `env:` if they
+ *     want — that puts the value in the row plaintext, which is their call).
+ *   - No inline-`cmd: "X=value ..."` scan. Same reasoning.
  */
 
 import * as path from 'node:path';
 import { UnrecoverableError } from '../types.ts';
 import {
-  INHERITABLE,
-  INHERITABLE_NAMES,
-  ALL_SHADOW_KEYS,
-  inheritedByShadowKey,
-  isInheritableSecret,
-  type InheritableSecret,
+  INHERIT_NAME_RE,
+  resolveInheritValue,
 } from './shell-inherit.ts';
 import { loadConfig, type GBrainConfig } from '../../config.ts';
 
@@ -36,15 +41,14 @@ export interface ValidatedShellJobParams {
   argv?: string[];
   cwd: string;
   env?: Record<string, string>;
-  inherit?: InheritableSecret[];
+  inherit?: string[];
 }
 
 export interface ValidateShellJobOpts {
   /**
-   * Loaded gbrain config used to verify every name in `inherit:` actually has
-   * a value the worker can resolve. Pass `null` when no config is loaded
-   * (validator will fail-fast on any inherit request). Defaults to calling
-   * `loadConfig()` when undefined — the typical CLI / op-handler path.
+   * Loaded gbrain config used to verify every `inherit` name resolves to a
+   * value. Pass `null` to fail-fast on any inherit request. Defaults to
+   * calling `loadConfig()` when undefined — the typical CLI / op-handler path.
    *
    * Test seam: pass `{ config }` explicitly to drive the validator with a
    * stubbed config in hermetic unit tests instead of mocking the module.
@@ -55,7 +59,7 @@ export interface ValidateShellJobOpts {
 /**
  * Validate raw shell-job submission `data`. Returns the narrowed shape on
  * success; throws `UnrecoverableError` with an operator-facing message on
- * every failure path.
+ * every failure path. Validation errors are never retry-worthy.
  */
 export function validateShellJobParams(
   data: Record<string, unknown>,
@@ -107,115 +111,51 @@ export function validateShellJobParams(
     }
   }
 
-  const env = data.env as Record<string, string> | undefined;
-
-  // ---- `inherit` validation (new in v0.35.8.0) ----
-  let inherit: InheritableSecret[] | undefined;
+  // ---- `inherit` shape validation ----
+  // Free-form list of config-key names. The closed enum of v0.35-RC was
+  // overcautious for the single-uid trust model — the agent knows what it
+  // needs to pass to the child. We only enforce shape (snake_case) so audit
+  // logs stay readable and prototype-pollution shapes (`__proto__`) can't
+  // sneak through.
+  let inherit: string[] | undefined;
   if (data.inherit !== undefined) {
     if (!Array.isArray(data.inherit)) {
       throw new UnrecoverableError(
-        'shell: inherit must be an array of strings ' +
-        `(allowed: ${INHERITABLE_NAMES.join(', ')}; see: docs/guides/minions-shell-jobs.md#secrets)`,
+        'shell: inherit must be an array of config-key names ' +
+        '(see: docs/guides/minions-shell-jobs.md#secrets)',
       );
     }
     const items = data.inherit as unknown[];
     for (const item of items) {
-      if (!isInheritableSecret(item)) {
-        const got = typeof item === 'string' ? `"${item}"` : typeof item;
+      if (typeof item !== 'string' || item.length === 0) {
         throw new UnrecoverableError(
-          `shell: inherit contains unknown name ${got}; allowed: ${INHERITABLE_NAMES.join(', ')} ` +
+          'shell: inherit entries must be non-empty strings ' +
           '(see: docs/guides/minions-shell-jobs.md#secrets)',
         );
       }
-    }
-    inherit = items as InheritableSecret[];
-  }
-
-  // ---- H1 (codex v0.36.5.0): cmd / argv inline-secret scan ----
-  // Without this, a caller can bypass the env-key validator entirely by writing
-  // `cmd: "GBRAIN_DATABASE_URL=postgresql://... gbrain sync"` — the URL lands
-  // plaintext in `minion_jobs.data.cmd` and the shell-audit cmd_display. The
-  // env-key validator below doesn't see this because the secret is embedded in
-  // the command string, not the structured `env:` map. Match
-  // `WORD=value` shell-inline-assignment patterns at the start of cmd or
-  // anywhere in argv, anchored to known shadow-key names. The check is a
-  // signal-strength heuristic — a determined caller can still base64-encode or
-  // obfuscate, but the common typo / PR-1137-pattern shapes are caught.
-  const SHADOW_INLINE_RE = new RegExp(
-    `(?:^|[\\s;&|])(${Array.from(ALL_SHADOW_KEYS).join('|')})=`,
-    'i',
-  );
-  if (typeof data.cmd === 'string' && SHADOW_INLINE_RE.test(data.cmd)) {
-    const m = data.cmd.match(SHADOW_INLINE_RE);
-    const key = m?.[1] || 'secret';
-    const which = inheritedByShadowKey(key);
-    const hint = which
-      ? `use \`inherit: ["${which}"]\` instead`
-      : 'use the `inherit:` allowlist instead';
-    throw new UnrecoverableError(
-      `shell: cmd contains inline secret assignment "${key}=..." — ${hint}. ` +
-      'Inline secrets in cmd land plaintext in `minion_jobs.data` and the ' +
-      'shell-audit JSONL. See: docs/guides/minions-shell-jobs.md#secrets',
-    );
-  }
-  if (Array.isArray(data.argv)) {
-    for (const tok of data.argv as unknown[]) {
-      if (typeof tok === 'string' && SHADOW_INLINE_RE.test(tok)) {
-        const m = tok.match(SHADOW_INLINE_RE);
-        const key = m?.[1] || 'secret';
-        const which = inheritedByShadowKey(key);
-        const hint = which
-          ? `use \`inherit: ["${which}"]\` instead`
-          : 'use the `inherit:` allowlist instead';
+      if (!INHERIT_NAME_RE.test(item)) {
         throw new UnrecoverableError(
-          `shell: argv contains inline secret assignment "${key}=..." — ${hint}. ` +
-          'See: docs/guides/minions-shell-jobs.md#secrets',
+          `shell: inherit name "${item}" must match [a-z][a-z0-9_]* ` +
+          '(snake_case config-key shape; see: docs/guides/minions-shell-jobs.md#secrets)',
         );
       }
     }
+    inherit = items as string[];
   }
 
-  // ---- T3: env-shadow rejection (applies regardless of inherit) ----
-  // A caller cannot route a secret via plain `env:` regardless of whether they
-  // also requested it via `inherit:`. This closes the leak path PR #1137's
-  // plain-env-secret workaround opened. Without this rule, any caller could
-  // bypass inherit by just writing the env var directly — the secret still
-  // lands plaintext in `minion_jobs.data`.
-  if (env !== undefined) {
-    for (const envKey of Object.keys(env)) {
-      if (ALL_SHADOW_KEYS.has(envKey)) {
-        const which = inheritedByShadowKey(envKey);
-        const hint = which
-          ? `use \`inherit: ["${which}"]\` instead`
-          : 'use the `inherit:` allowlist instead';
-        // F3: when caller passed BOTH inherit:[X] AND env:{shadowKey}, give
-        // the explicit shadow message; otherwise give the general one.
-        const isShadowOfRequested = which !== undefined && inherit?.includes(which);
-        const prefix = isShadowOfRequested
-          ? `shell: env ${envKey} shadows inherit["${which}"]`
-          : `shell: env ${envKey} is a secret`;
-        throw new UnrecoverableError(
-          `${prefix} — ${hint}. ` +
-          'See: docs/guides/minions-shell-jobs.md#secrets',
-        );
-      }
-    }
-  }
-
-  // ---- F1: fail-fast on missing config value for any requested inherit ----
-  // If the worker can't actually resolve the requested secret, reject at
-  // submit-time with a paste-ready fix pointing at the exact config key to
-  // set. Without this, a child process would receive an empty/undefined env
-  // var and fail later with a vague "No database URL" downstream.
+  // ---- Fail-fast on missing config value ----
+  // UX guardrail: if the worker can't resolve a requested name, fail at
+  // submit-time with a paste-ready fix. Without this, the child gets an
+  // unset env var and fails minutes later with a less precise error.
   if (inherit !== undefined && inherit.length > 0) {
     const cfg = opts.config !== undefined ? opts.config : loadConfig();
     for (const name of inherit) {
-      const value = INHERITABLE[name].read(cfg);
-      if (typeof value !== 'string' || value.length === 0) {
+      const value = resolveInheritValue(cfg, name);
+      if (value === undefined) {
         throw new UnrecoverableError(
           `shell: inherit requested "${name}" but worker has no ${name} configured. ` +
-          `Fix: \`gbrain config set ${name} <value>\` or set ${INHERITABLE[name].envKey} ` +
-          'in the worker env. (see: docs/guides/minions-shell-jobs.md#secrets)',
+          `Fix: \`gbrain config set ${name} <value>\` or set the value in the worker's config file. ` +
+          '(see: docs/guides/minions-shell-jobs.md#secrets)',
         );
       }
     }
@@ -225,8 +165,7 @@ export function validateShellJobParams(
     cmd: hasCmd ? (data.cmd as string) : undefined,
     argv: hasArgv ? (data.argv as string[]) : undefined,
     cwd: data.cwd as string,
-    env,
+    env: data.env as Record<string, string> | undefined,
     inherit,
   };
 }
-
