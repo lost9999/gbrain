@@ -77,3 +77,12 @@ export {
   resolvePack,
   _resetPackCacheForTests,
 } from './registry.ts';
+
+export {
+  loadActivePack,
+  resolveActivePackNameOnly,
+  __setPackLocatorForTests,
+  _resetPackLocatorForTests,
+  type LoadActivePackInput,
+  type PackLocator,
+} from './load-active.ts';
