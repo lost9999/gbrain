@@ -174,10 +174,15 @@ CREATE INDEX IF NOT EXISTS idx_links_origin ON links(origin_page_id);
 -- postgres-engine.ts both JOIN page_links pl ON pl.to_page_id = p.id). The
 -- alias predates the table-name standardization; the canonical table is
 -- links. Brainstorm domain-bank connection_count tiebreaker and the
--- doctor link-density score read through this view. Without it, every
--- query that mentions page_links fails with relation page_links does
--- not exist, and the affected commands return zero rows.
-CREATE OR REPLACE VIEW page_links AS SELECT * FROM links;
+-- doctor link-density score read through this view.
+--
+-- The projection is intentionally NARROW (id, from_page_id, to_page_id only).
+-- Engine queries only reference pl.id (via COUNT(*)) and pl.to_page_id.
+-- Including link_source / origin_page_id / etc. in the view would couple
+-- the alias to columns that didn't exist in pre-v0.13 brains AND would
+-- block ALTER TABLE DROP COLUMN on those columns during upgrades.
+CREATE OR REPLACE VIEW page_links AS
+  SELECT id, from_page_id, to_page_id FROM links;
 
 -- ============================================================
 -- tags

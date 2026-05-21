@@ -3782,8 +3782,14 @@ export const MIGRATIONS: Migration[] = [
     //
     // Discovered during the brainstorm-cathedral wave when the E2E test had
     // to workaround the missing view to exercise the resume path.
+    //
+    // Narrow projection (id, from_page_id, to_page_id) so the view does not
+    // depend on columns added in later migrations (link_source,
+    // origin_page_id, resolution_type) — keeps ALTER TABLE DROP COLUMN
+    // and the bootstrap forward-reference probes unblocked on legacy brains.
     sql: `
-      CREATE OR REPLACE VIEW page_links AS SELECT * FROM links;
+      CREATE OR REPLACE VIEW page_links AS
+        SELECT id, from_page_id, to_page_id FROM links;
     `,
   },
 ];

@@ -1,6 +1,10 @@
 # TODOS
 
 
+## v0.37.9.x pre-existing test failures (P0)
+
+- [ ] **P0: `test/doctor-report-remote.test.ts` "full report on healthy brain is healthy status" fails** with `health_score = 50, expected >= 70` on a fresh PGLite engine. Verified to fail on `master` too (independent of the v0.38 cathedral wave) by checking out master's `src/commands/doctor.ts` and re-running. The remote doctor is grading a freshly-initialized empty brain at 50/100. Either the grading rubric should treat "empty brain" as healthy (special case), or the test's seed should bring the brain above the threshold. Investigate `src/commands/doctor.ts:doctorReportRemote` health-score calculation against an empty PGLite. Noticed during /ship of `garrytan/shanghai-v3` on 2026-05-21.
+
 ## v0.37.x brainstorm cost-cathedral follow-ups (filed during T12)
 
 - [ ] **Explicit `--max-cost` flag on `gbrain extract`, `gbrain enrich`, `gbrain integrity auto`.** v0.37.x ships gateway-layer enforcement via `withBudgetTracker` — wrapping any of those commands at their entrypoint with `withBudgetTracker(tracker, fn)` immediately gives them the same cap semantics that brainstorm + doctor --remediate have. The CLI flag wiring (parse `--max-cost`, construct `BudgetTracker` with `maxCostUsd`, wrap the entrypoint) is the only missing piece. ~30 lines each plus smoke tests. Deferred per the plan's "NOT in scope" — gateway-layer composition was the structural goal; the per-command flag wiring is the next ergonomic win.
