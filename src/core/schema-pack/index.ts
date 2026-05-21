@@ -102,3 +102,8 @@ export {
   expertTypesFromPack,
   expertTypesFromPackOrThrow,
 } from './expert-types.ts';
+
+export {
+  extractableTypesFromPack,
+  isExtractableType,
+} from './extractable.ts';

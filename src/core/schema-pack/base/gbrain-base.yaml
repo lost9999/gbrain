@@ -58,7 +58,7 @@ page_types:
     path_prefixes:
       - writing/
     aliases: []
-    extractable: false
+    extractable: true
     expert_routing: false
 
   - name: analysis
@@ -110,7 +110,7 @@ page_types:
       - people/
       - person/
     aliases: []
-    extractable: true
+    extractable: false
     expert_routing: true
 
   - name: company
@@ -119,7 +119,7 @@ page_types:
       - companies/
       - company/
     aliases: []
-    extractable: true
+    extractable: false
     expert_routing: true
 
   - name: deal
@@ -128,7 +128,7 @@ page_types:
       - deals/
       - deal/
     aliases: []
-    extractable: true
+    extractable: false
     expert_routing: false
 
   - name: yc
@@ -162,7 +162,7 @@ page_types:
       - sources/
       - source/
     aliases: []
-    extractable: false
+    extractable: true
     expert_routing: false
 
   - name: media
@@ -180,7 +180,7 @@ page_types:
       - emails/
       - email/
     aliases: []
-    extractable: false
+    extractable: true
     expert_routing: false
 
   - name: slack
@@ -188,7 +188,7 @@ page_types:
     path_prefixes:
       - slack/
     aliases: []
-    extractable: false
+    extractable: true
     expert_routing: false
 
   - name: calendar-event
@@ -197,7 +197,7 @@ page_types:
       - cal/
       - calendar/
     aliases: []
-    extractable: false
+    extractable: true
     expert_routing: false
 
   - name: note
@@ -206,7 +206,7 @@ page_types:
       - notes/
       - note/
     aliases: []
-    extractable: false
+    extractable: true
     expert_routing: false
 
   - name: meeting
