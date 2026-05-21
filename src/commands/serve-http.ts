@@ -638,6 +638,58 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
   });
 
+  // v0.38 Slice 4 — per-OAuth-client agent spend viewer. Pre-computes today's
+  // spend (committed + pending reservations) per client so the Agents tab
+  // can render a "$X / $Y today" cell. Read-side endpoint only — no mutation.
+  // Falls back to an empty array on pre-v0.38 brains where mcp_spend_log
+  // exists but agent dispatch hasn't recorded anything.
+  app.get('/admin/api/agents/spend', requireAdmin, async (_req: Request, res: Response) => {
+    try {
+      const rows = await sql`
+        SELECT
+          c.client_id,
+          c.client_name,
+          COALESCE(c.budget_usd_per_day, NULL) AS cap_usd_per_day,
+          COALESCE((
+            SELECT SUM(spend_cents)::text
+              FROM mcp_spend_log
+             WHERE client_id = c.client_id
+               AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+          ), '0') AS spent_cents_today,
+          COALESCE((
+            SELECT SUM(estimated_cents)::text
+              FROM mcp_spend_reservations
+             WHERE client_id = c.client_id
+               AND status = 'pending'
+               AND expires_at > now()
+          ), '0') AS pending_cents,
+          COALESCE((
+            SELECT COUNT(*)::int
+              FROM minion_jobs
+             WHERE name = 'subagent'
+               AND status IN ('waiting', 'active', 'waiting-children')
+               AND data->>'__owner_client_id' = c.client_id
+          ), 0) AS inflight_count
+        FROM oauth_clients c
+        WHERE c.deleted_at IS NULL
+          AND ('agent' = ANY (string_to_array(c.scope, ' ')) OR c.bound_tools IS NOT NULL)
+        ORDER BY c.client_name ASC
+      `;
+      res.json(rows.map(r => ({
+        client_id: String(r.client_id),
+        client_name: String(r.client_name ?? r.client_id),
+        cap_usd_per_day: r.cap_usd_per_day ? parseFloat(String(r.cap_usd_per_day)) : null,
+        spent_cents_today: parseFloat(String(r.spent_cents_today ?? '0')),
+        pending_cents: parseFloat(String(r.pending_cents ?? '0')),
+        inflight_count: Number(r.inflight_count ?? 0),
+      })));
+    } catch (e) {
+      // Pre-v0.38 brains: tables may not exist yet. Return empty so the UI
+      // renders gracefully instead of erroring.
+      res.json([]);
+    }
+  });
+
   app.get('/admin/api/stats', requireAdmin, async (_req: Request, res: Response) => {
     try {
       const [clients] = await sql`SELECT count(*)::int as count FROM oauth_clients`;
