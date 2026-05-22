@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.37.10.0] - 2026-05-21
+## [0.37.11.0] - 2026-05-21
 
 **Fresh `gbrain init --pglite` works out of the box now.**
 
@@ -48,7 +48,7 @@ Filed in TODOS.md:
 - Worker-pool shared `AbortController` in `embedAll()` as defense-in-depth on top of the entry-point pre-flight.
 - Cleanup of back-compat constants in `src/core/embedding.ts` (legacy `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` exports for old tests).
 
-### To take advantage of v0.37.10.0
+### To take advantage of v0.37.11.0
 
 `gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a dim mismatch:
 

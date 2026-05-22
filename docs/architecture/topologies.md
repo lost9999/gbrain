@@ -291,7 +291,7 @@ gbrain reinit-pglite --embedding-model voyage:voyage-code-3 --embedding-dimensio
 gbrain reindex --code --yes
 ```
 
-(`gbrain config set embedding_model` is refused as of v0.37.10.0 because
+(`gbrain config set embedding_model` is refused as of v0.37.11.0 because
 the schema column has to resize alongside the config.)
 
 `gbrain reindex --code` prints a recommendation when the configured

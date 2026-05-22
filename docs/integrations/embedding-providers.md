@@ -149,7 +149,7 @@ Four options:
 
 ## Switching providers on an existing brain
 
-Embedding dimensions are baked into the schema at `gbrain init` time. As of v0.37.10.0, `gbrain config set embedding_model` and `gbrain config set embedding_dimensions` are refused — the schema column has to resize alongside the config, and `config set` only touches the config row.
+Embedding dimensions are baked into the schema at `gbrain init` time. As of v0.37.11.0, `gbrain config set embedding_model` and `gbrain config set embedding_dimensions` are refused — the schema column has to resize alongside the config, and `config set` only touches the config row.
 
 The supported paths:
 
