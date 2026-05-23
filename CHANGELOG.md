@@ -2,6 +2,60 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.40.4.1] - 2026-05-23
+
+**Your doctor checks, your operations trust boundary, and your cycle phases now have real behavioral tests — not just source-grep guards.**
+
+Before this release, three of gbrain's load-bearing surfaces shipped with structural tests only: the 50+ doctor checks were verified by grepping source code for check names; the 74 MCP operations were checked for scope annotations but no test proved that `localOnly: true` actually keeps an op off the HTTP wire; and the cycle phases that compose the maintenance loop had no test pinning their result-mapping (counter → status enum). When a refactor accidentally dropped a check or flipped a localOnly flag, the existing tests stayed green. The v0.38.2.0 partial-scan wave was one example — a render bug slipped through because no test drove the doctor orchestrator end-to-end.
+
+This wave adds the missing behavioral coverage. `gbrain doctor --json` now has a subprocess smoke test that runs the full render path against a fresh PGLite tempdir brain and asserts the schema_version=2 envelope, the status enum, and the check list integrity. The doctor's check-building logic was extracted into a small `buildChecks` function so behavioral tests can drive it directly without `process.exit` getting in the way — the wrapper still handles all 10 process.exit sites unchanged, snapshot-pinned so accidental check drop-outs fail loudly at PR review time. The operations trust-boundary surface gets a table-driven contract test over all 74 ops plus targeted handler-invocation regressions for the three historically-broken classes (HTTP MCP shell-job RCE, search_by_image image_path leak, plus the lint contract that file_upload's strict-mode confinement holds). A new shell guard in the `bun run verify` chain catches any future HTTP-exposing module that imports the operations list without applying the `localOnly` filter — the bypass that motivated the v0.26.9 hardening pass.
+
+Two pre-existing master-test flakes get root-caused as part of the same wave: `test/ai/gateway.test.ts` was leaking `OPENAI_API_KEY=openai-fake` into the gateway's module-scoped state, poisoning sibling tests in the same shard that called real `embed()` paths (afterAll cleanup added); and `test/ai/header-transport.test.ts` raced its synthetic recipe registration with sibling files that also mutated the gateway, returning `'[]'` instead of `'ok'` under shard parallelism (file quarantined as `.serial.test.ts`). Neither was a regression from this branch — both were latent bugs that surfaced because the new fast-loop coverage exercised more of the surface concurrently.
+
+### How to take advantage of v0.40.4.1
+
+The added coverage is invisible at runtime. There's nothing to enable or configure — your next `bun run test` already includes 39 new test cases pinning the doctor, operations, and cycle contracts. If you've been wondering whether to trust `gbrain doctor`'s output after a refactor, the new behavioral tests are now the answer.
+
+If you maintain a downstream gbrain fork or extension that imports from `core/operations.ts`, run `bun run check:operations-filter-bypass` once. It'll catch any of your modules that brought the `operations` value in without applying the canonical `.filter(op => !op.localOnly)` filter — three import shapes are detected (destructured, aliased, namespace).
+
+### Itemized changes
+
+#### Doctor refactor (no behavior change, full coverage)
+
+- **`src/commands/doctor.ts:1604` — extract `buildChecks(engine, args, dbSource): Promise<Check[]>` from `runDoctor`.** The check-building logic moves into the new exported function; the existing exported `computeDoctorReport(checks)` at line 78 stays untouched. `runDoctor` is now a thin wrapper: `buildChecks → computeDoctorReport → render + process.exit`. All 10 `process.exit` sites stay where they are (lines 2199, 2220, the 5 inside `--locks` mode, and the remediation subcommands). The two early-return paths (no engine, connection failure) drop their inline `outputResults + process.exit` calls and `return checks` instead — the wrapper still produces identical observable output because both render the same partial check list.
+
+- **`test/doctor-behavioral.test.ts` (new, 13 cases).** Drives `buildChecks` against PGLite. Pure pure-aggregation cases pin `computeDoctorReport` math: 1 fail → -20 points, 3 fails → -60, mixed ok+warn+fail → unhealthy with the fail outcome dominating, score clamped at 0. Orchestrator cases assert `--fast` flag honors the skip set, `--json` arg doesn't alter the check list, the no-engine path returns a partial list without calling `process.exit`, and the snapshot of load-bearing check names (`connection`, `schema_version`, `brain_score`, `sync_freshness`, `search_mode`, `eval_drift`, `reranker_health`, `embedding_width_consistency`, `autopilot_lock_scope`) catches any accidental check drop-out during future refactors.
+
+- **`test/doctor-cli-smoke.serial.test.ts` (new, 1 case).** Subprocess smoke spawning `bun run src/cli.ts doctor --json` against a fresh PGLite tempdir brain via `GBRAIN_HOME=$(mktemp -d)`. Asserts exit code 0 on a freshly-initialized brain, the JSON envelope parses, `schema_version === 2`, `status` is one of `healthy`/`warnings`/`unhealthy`, and `checks` is a non-empty array. Catches render-path bugs that buildChecks-only tests miss — the class the v0.38.2.0 partial-scan wave exposed. Skip via `GBRAIN_SKIP_SUBPROCESS_TESTS=1` for shard-time control; quarantined as `.serial.test.ts` because PGLite write-locks don't play well with parallel runners.
+
+#### Operations trust-boundary contract
+
+- **`test/operations-trust-boundary.test.ts` (new, 14 cases).** Hybrid design: pure assertions over all 74 ops cover the cheap drift-detection win (every op has a scope annotation; every mutating op has a non-read scope; scope is one of the documented enum values; `hasScope(['read'], op.scope)` correctly rejects when op.scope is 'admin' or 'write'). Plus the canonical filter contract: every `localOnly: true` op is excluded from `operations.filter(op => !op.localOnly)`. Plus targeted handler-invocation cases for the two historically-broken HTTP-callable classes: `submit_job` with `name='shell'` + `ctx.remote=true` MUST reject (the F7b HTTP MCP shell-job RCE class), and `search_by_image` with `image_path` + `ctx.remote=true` MUST reject (the D18 P0 image-leak class). `file_upload` and `sync_brain` are deliberately omitted from handler-invocation tests because they're `localOnly: true` — calling their handlers directly would test an impossible production path (codex CMT-3 caught this during plan review). The seven historically-sensitive `localOnly` ops are snapshot-pinned by name: `sync_brain`, `file_upload`, `file_list`, `file_url`, `purge_deleted_pages`, `get_recent_transcripts`, `code_traversal_cache_clear`.
+
+- **`scripts/check-operations-filter-bypass.sh` (new shell guard, wired into `bun run verify`).** Greps `src/` for any module that imports the `operations` value from `core/operations.ts` outside the canonical filter site at `src/commands/serve-http.ts`. Three import shapes are detected: destructured (`import { operations }`), aliased (`import { operations as ops }`), and namespace (`import * as opsModule`). An explicit allow-list of 10 known-safe importers (CLI, dispatch, stdio MCP, the older http-transport, the tool-def helper, the subagent registry, three CLI tools, and serve-http itself) is documented with a one-line rationale per entry. Plus a check that `serve-http.ts` still contains the literal `operations.filter(op => !op.localOnly)` expression — refactoring it out fails the build. Type-only imports of sibling exports like `sourceScopeOpts` and `OperationContext` are deliberately not flagged.
+
+#### Cycle phase wrappers
+
+- **`src/core/cycle.ts:518, 552` — export `runPhaseLint` + `runPhaseBacklinks`.** Adds the `export` keyword to two existing phase functions so behavioral tests can drive them directly. No body changes; no behavior change. Documented as internal helpers exposed for test-only consumption — downstream code should NOT take a dependency on them.
+
+- **`test/cycle-legacy-phases.test.ts` (new, 11 cases).** Combined file with two `describe` blocks for `runPhaseLint` + `runPhaseBacklinks`. Narrowed to result-mapping + error envelope per codex CMT-1 (the legacy phases don't extend `BaseCyclePhase` and don't take a progress reporter or AbortSignal directly, so the contract surface they actually have is the counter → status enum mapping plus the try/catch error envelope). Cases: clean run → status='ok' with summary format, partial fix → status='warn' with `dryRun` in details, dry-run path doesn't write, throw-from-lib → status='fail' with the wrapper's try/catch envelope populated (verified that the throw doesn't escape). Future phase wrappers (sync, extract, embed, orphans, extract_facts, resolve_symbol_edges, recompute_emotional_weight) land as additional describes here, not as new files.
+
+#### Pre-existing master flakes — root-cause fixes (not bandaids)
+
+- **`test/ai/gateway.test.ts` — add `afterAll(() => resetGateway())` cleanup hook.** The file's tests each call `beforeEach(() => resetGateway())` so per-test pollution within the file was handled. But the file's LAST test set `configureGateway({env: {OPENAI_API_KEY: 'openai-fake'}})` and left that state in the gateway module. Other test files in the same bun shard (notably `test/ingestion/ingest-capture.test.ts`) then called code paths that triggered `embed()` without first calling `configureGateway`, hit the real OpenAI endpoint with the leaked fake key, and returned `Incorrect API key provided: openai-fake`. The shard wedged. One-line fix at file teardown stops the leak.
+
+- **`test/ai/header-transport.serial.test.ts` — quarantined from the parallel fast loop (renamed from `header-transport.test.ts`).** The file mutates `RECIPES` (the gateway's module-scoped recipe map) and `configureGateway` to register synthetic recipes, then asserts that `fakeChatFetch` was invoked. Under bun's intra-shard parallelism, sibling files like `test/ai/rerank.test.ts` and `test/gateway-embed-model-override.test.ts` race the same gateway state — the chat test would see `result.text === '[]'` instead of `'ok'` because a parallel test called `resetGateway` between this test's `configureGateway` and its `chat` call. The `.serial.test.ts` rename moves the file out of the parallel pass into the serial-after pass at `--max-concurrency=1` per repo convention.
+
+### Honest notes
+
+Three of the original 10 audit gaps turned out to be non-gaps after surveying the actual repo state — `test/ingestion/{dedup,daemon,skillpack-load}.test.ts` and `test/phantom-redirect.test.ts` already existed with thorough coverage (88 ingestion tests, 38 phantom-redirect tests, all green). The audit was based on stale information. The four real gaps (doctor behavioral, cycle phase wrappers, operations trust-boundary contract, shell guard for HTTP filter) all shipped.
+
+Four follow-up TODOs filed (in the plan file, not TODOS.md yet):
+- NEW-1: per-check leaf unit tests for the 20+ exported doctor check functions (codex CMT-2 deep fix)
+- NEW-2: cycle-phase wrappers for the other 7 phases (sync, extract, embed, orphans, extract_facts, resolve_symbol_edges, recompute_emotional_weight)
+- NEW-3: HTTP-level trust-boundary E2E that proves serve-http.ts honors the localOnly filter at runtime (codex CMT-3 strongest defense)
+- NEW-4: render function extraction from runDoctor (would let doctor-cli-smoke move back into the parallel fast loop)
+
 ## [0.39.2.0] - 2026-05-22
 
 **Your federated brain refreshes all its sources in parallel now, not one at a time.**
