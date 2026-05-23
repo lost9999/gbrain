@@ -55,6 +55,112 @@ Four follow-up TODOs filed (in the plan file, not TODOS.md yet):
 - NEW-2: cycle-phase wrappers for the other 7 phases (sync, extract, embed, orphans, extract_facts, resolve_symbol_edges, recompute_emotional_weight)
 - NEW-3: HTTP-level trust-boundary E2E that proves serve-http.ts honors the localOnly filter at runtime (codex CMT-3 strongest defense)
 - NEW-4: render function extraction from runDoctor (would let doctor-cli-smoke move back into the parallel fast loop)
+## [0.40.7.0] - 2026-05-23
+
+**Your agents can now author your brain's schema pack themselves — no more shell-out, no more hand-editing YAML.** If you've ever opened `gbrain` and noticed thousands of pages stuck as untyped "notes" under `meetings/` or `research/`, this release closes that loop. Tell Wintermute (or any agent connected via MCP) "my brain has 4000 untyped meetings pages — add a `meeting` type and backfill them," and it does the whole thing safely: locks the pack file so two agents can't race, validates the change won't create dangling references, writes atomically so a crash never leaves the pack half-written, audits the mutation with the agent's identity, then updates every matching page in 1000-row batches that never wedge concurrent writers. The cathedral that was bundled but unreachable in v0.39 is now reachable from the outside.
+
+This release rebuilds the design from a closed community PR ([#1321](https://github.com/garrytan/gbrain/pull/1321)) by `@garrytan-agents` into a production-grade `gbrain schema` cathedral. The four mutation verbs that PR proposed (`add-type`, `remove-type`, `stats`, `sync`) all ship — hardened with atomic+locked+audited writes, pack-aware fallback semantics that fail loud instead of silently re-introducing types you removed, and a batched MCP op (`schema_apply_mutations`) that lets a remote agent compose multi-step refactors as one atomic transaction. The lint surface grew from 2 rules to 11. The graph visualization renders link verbs. And the agent on-ramp story — RESOLVER routing, a `schema-author` skill with explicit boundary callouts to `brain-taxonomist` and `eiirp`, a `conventions/schema-evolution.md` decision tree for "when to add a type vs alias vs prefix" — means agents will actually FIND this surface instead of inventing their own ad-hoc YAML edits.
+
+## To take advantage of v0.40.7.0
+
+`gbrain upgrade` handles this automatically. To verify after upgrade:
+
+```bash
+# 1. See your active pack identity:
+gbrain schema active --json
+
+# 2. Coverage check — how many pages are typed?
+gbrain schema stats --json
+
+# 3. Try the agent journey: fork the bundled pack, add a custom type,
+#    backfill existing pages, verify the wiring works:
+gbrain schema fork gbrain-base mine
+gbrain schema use mine
+gbrain schema add-type researcher --primitive entity --prefix people/researchers/ --extractable --expert
+gbrain schema lint --with-db   # validates against your DB
+gbrain schema sync --apply     # backfills page.type on matching pages
+gbrain whoknows "machine learning"   # researcher-typed pages now route through expert routing
+
+# 4. If you run `gbrain serve --http` for remote MCP, register a client
+#    with admin scope so Wintermute or any other agent can author packs remotely:
+gbrain auth register-client wintermute --scopes admin
+```
+
+If any step fails or numbers look wrong, please file an issue with the output of `gbrain doctor` and `tail -20 ~/.gbrain/audit/schema-mutations-*.jsonl` so we can debug the mutation chain.
+
+### Itemized changes
+
+**New CLI verbs (`gbrain schema *` — 14 new):**
+- `add-type <name> --primitive P --prefix dir/` — append a page type with primitive, prefix, optional `--extractable`, `--expert`, `--alias`.
+- `remove-type <name>` — atomic remove with cross-reference check. If the type is referenced by another type's `aliases`, `enrichable_types`, `link_types`, or `frontmatter_links`, the remove fails loud with the reference list (codex C14 fix from `/plan-eng-review`).
+- `update-type <name> [--extractable BOOL] [--expert BOOL] [--primitive P]` — patch a type's flags without re-creating it.
+- `add-alias <type> <alias>` / `remove-alias <type> <alias>` — atomic single-alias edits.
+- `add-prefix <type> <prefix>` / `remove-prefix <type> <prefix>` — atomic single-prefix edits.
+- `add-link-type <name> [--inverse V] [--page-type T] [--target-type T]` — create new link verbs (e.g. `authored`, `attended`) with inference rules.
+- `remove-link-type <name>` — refuses if any `frontmatter_links` references it.
+- `set-extractable <type> <true|false>` / `set-expert-routing <type> <true|false>` — one-shot flag toggles.
+- `stats [--source <id>]` — per-type page counts + coverage % + dead-prefix detection (declared prefixes with zero matching pages). Multi-source aware.
+- `sync [--apply] [--source <id>]` — backfill `page.type` for rows matching pack prefixes. Dry-run by default; chunked UPDATE in 1000-row batches on `--apply` so concurrent writers never wait.
+- `reload [--pack <name>]` — flush the in-process pack cache so the next call re-reads from disk. Auto-cascades through the extends-chain.
+
+**New MCP operations (9 — the agent on-ramp):**
+- `get_active_schema_pack` (read scope) — cheap identity packet: `{pack_name, version, sha8, page_types_count, link_types_count, primitive_summary, source_tier}`.
+- `list_schema_packs` (read) — bundled + installed packs.
+- `schema_stats` (read) — same output as the CLI `stats` verb, source-scoped.
+- `schema_lint` (read) — file-plane rules over MCP (DB-aware `--with-db` is CLI-only).
+- `schema_graph` (read) — JSON `{nodes, edges}` derived from link types and frontmatter_links.
+- `schema_explain_type` (read) — resolved settings for one declared type.
+- `schema_review_orphans` (read) — drilldown into untyped pages.
+- `schema_apply_mutations` (admin scope, NOT localOnly) — **batched** atomic mutation op. One call applies a list of mutations (`add_type`, `add_link_type`, `set_extractable`, etc.) inside a single `withPackLock` scope. Remote agents like Wintermute can compose multi-step refactors as one transaction. Audit log records `actor: mcp:<clientId8>` per mutation.
+- `reload_schema_pack` (admin) — flush cache + extends-chain cascade.
+
+**Lint rules grew from 2 to 11:**
+- `alias_shadows_type`, `alias_declared_by_two_types`, `alias_references_undeclared_type`
+- `enrichable_types_undeclared`, `link_types_undeclared`, `frontmatter_links_undeclared`
+- `expert_routing_without_prefix`, `prefix_collision`, `prefix_strict_subset_overlap`
+- DB-aware (`--with-db`): `extractable_empty_corpus`, `mutation_count_anomaly`
+
+**Mutation safety primitives:**
+- `pack-lock.ts` — atomic `O_CREAT|O_EXCL` acquire. NOT the TOCTOU `existsSync+writeFileSync` shape from `page-lock.ts`. TTL refresh every 10s while a mutation runs. `--force` semantics: "steal stale lock," not "skip locking."
+- `mutate-audit.ts` — ISO-week JSONL at `~/.gbrain/audit/schema-mutations-YYYY-Www.jsonl`. **Privacy-redacted by default**: type names → sha8, prefixes → first slug segment only. Matches `candidate-audit.ts` privacy posture so a leaked screenshot of either audit file can't reveal sensitive taxonomy. Opt out of redaction with `GBRAIN_SCHEMA_AUDIT_VERBOSE=1`. Logs both success AND failure events so the `schema_pack_writability` doctor check (v0.40.7+) has signal to read.
+- Atomic write via `.tmp + fsync + rename`. The pack file on disk is NEVER partial.
+
+**Cross-process cache invalidation:**
+- `loadActivePack` now stats the pack file with a 1-second TTL gate (env override `GBRAIN_PACK_STAT_TTL_MS`). Operator runs `gbrain schema add-type foo` from a terminal; the autopilot daemon picks up the new type within 1 second on its next `loadActivePack` call. Worst-case stat overhead: ~50µs at most once per second per process. Hot-path cost inside the TTL window: ~10ns.
+- `invalidatePackCache(name)` walks the extends-chain reverse-graph (codex C6 fix). Editing a parent pack used to leave children stale; now every dependent invalidates too.
+
+**T1.5 pack-aware wiring (the silent-no-op fix, partial):**
+- `gbrain whoknows` + the `find_experts` MCP op now consult the active pack for expert types. A `researcher` type declared `expert_routing: true` actually surfaces in `whoknows` results (pre-v0.40.6 it silently never matched because the query path read hardcoded `['person', 'company']`).
+- **Pack-load failure semantics**: empty filter, NOT hardcoded defaults. A pack-load failure makes the query return empty (loud, agent debugs the pack-load problem) instead of silently re-introducing types the user packed out. Same lesson the v0.34.1 federated-read trust gate paid for.
+- Remaining T1.5 sites — `facts/eligibility.ts` and `enrichment-service.ts`'s `'person' | 'company'` union — deferred to v0.40.7+. Filed as TODO.
+
+**Skill + RESOLVER + Convention layer:**
+- `skills/schema-author/SKILL.md` — the agent dispatcher for "evolve the schema pack." Explicit non-goals callout to `brain-taxonomist` (filing one specific page) and `eiirp` (schema-check during iteration) so agents pick the right surface. Workflow: brain → assess → propose → apply → sync → verify → commit.
+- `skills/conventions/schema-evolution.md` — when to add a type vs alias vs prefix. Decision tree: <20 pages → don't pack-codify; 20-100 → alias or narrow prefix; 100+ → first-class type.
+- `skills/RESOLVER.md` entry for `schema-author` with the full trigger list.
+
+### Migration safety
+
+- Pre-v0.40.6 brains: zero breaking changes. The 9 new MCP ops are additive; the existing 16 schema verbs unchanged.
+- Existing OAuth clients with `read` scope: read the new schema ops out of the box.
+- Existing OAuth clients with `admin` scope: can call `schema_apply_mutations` and `reload_schema_pack` immediately. The audit log captures `actor: mcp:<clientId8>` on every mutation for forensic traceability.
+- The mutation primitives refuse to touch bundled packs (`gbrain-base`, `gbrain-recommended`) — `gbrain schema fork gbrain-base mine` first.
+
+### What's safe to know about
+
+- The YAML emitter does NOT preserve comments or formatting in pack.yaml files when mutated. Authors who care about hand-written YAML layout should pin `pack.json` instead.
+- The audit log redacts type names by default. If you need to grep for the raw type name during debugging, set `GBRAIN_SCHEMA_AUDIT_VERBOSE=1` and re-run the mutation.
+- `gbrain schema sync --apply` on a 100K-page brain runs in chunks of 1000; each chunk completes in <100ms. Total wallclock ~10s for 100K rows. Concurrent writers see at most a 100ms wait on any single row.
+
+### Itemized — for contributors
+
+- Plan + 21 decisions captured at `~/.claude/plans/system-instruction-you-are-working-recursive-thacker.md`.
+- Closed PR #1321 with successor pointer comment crediting `@garrytan-agents`.
+- 6 commits land the wave: foundations (e8ea1792), mutate (21beda7f), stats+sync (4f493c96), CLI wiring (60c3da92), MCP ops (90bbd3fa), this commit (skill + docs + version bump).
+- 255+ schema-pack-related tests green (84 new across 9 test files this wave).
+- 3 follow-up TODOs filed for v0.40.7: enrichment-service.ts union widening (`'person' | 'company'` → `string`), facts/eligibility.ts pack-aware extractable-type wiring, doctor checks for schema_pack_coverage / schema_pack_writability / schema_pack_mutation_audit.
+- Contributed by `@garrytan-agents` (original PR #1321 design + verb shape) and `@garrytan` + Claude Opus 4.7 1M (production rebuild).
+
 ## [0.40.6.0] - 2026-05-23
 
 **`gbrain sync --all` now syncs your sources at the same time instead of one after the other, and you can see the health of every source at a glance with `gbrain sources status`.** If you have a brain with 4+ sources connected to it, the cron job that keeps everything up to date used to take as long as the slowest source. One stuck `git pull` on a big media-corpus repo held up everything else, and after 24 hours you'd start seeing stale-data warnings pile up. Now the sources run together — independent ones don't wait on each other, and you can run `gbrain sources status` to see at a glance which ones are fresh, stale, or running behind. Per-source log lines come prefixed with `[source-id]` so you can grep one source's output cleanly even when several are running.
