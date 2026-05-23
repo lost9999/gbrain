@@ -25,7 +25,7 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-});
+}, 30000); // 30s — PGLite WASM cold-start + 89 migrations exceeds 5s default
 
 afterAll(async () => {
   await engine.disconnect();

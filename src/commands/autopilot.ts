@@ -512,21 +512,42 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             process.stderr.write(JSON.stringify({ event: 'skip_healthy', score, plan_size: 0 }) + '\n');
           }
         } else if (shouldFullCycle) {
-          const job = await queue.add('autopilot-cycle',
-            { repoPath },
-            {
-              queue: 'default',
-              idempotency_key: `autopilot-cycle:${slot}`,
-              max_attempts: 2,
-              timeout_ms: timeoutMs,
-              maxWaiting: 1,
-            },
-          );
-          lastFullCycleAt = Date.now();
+          // v0.38: per-source fan-out replaces the single-job dispatch.
+          // dispatchPerSource enumerates sources via listAllSources
+          // ({ localPathOnly: true }), gates each on per-source
+          // `last_full_cycle_at` from sources.config JSONB, and fans out
+          // up to `fanoutMax` per tick (default 4 Postgres, 1 PGLite per
+          // codex P1-3). Fresh-install brains with no sources rows fall
+          // back to the legacy single autopilot-cycle so existing
+          // behavior is preserved.
+          const { dispatchPerSource, resolveFanoutMax } = await import('./autopilot-fanout.ts');
+          const fanoutMax = await resolveFanoutMax(engine);
+          const result = await dispatchPerSource(engine, queue, {
+            repoPath,
+            slot,
+            timeoutMs,
+            fanoutMax,
+            jsonMode,
+          });
+          if (result.dispatched.length > 0 || result.legacy_fallback) {
+            lastFullCycleAt = Date.now();
+          }
           if (jsonMode) {
-            process.stderr.write(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'full', slot, score, plan_size: plan.length }) + '\n');
-          } else {
-            console.log(`[dispatch] job #${job.id} autopilot-cycle (full; score=${score})`);
+            process.stderr.write(JSON.stringify({
+              event: 'fanout_summary',
+              dispatched: result.dispatched,
+              skipped_fresh: result.skipped_fresh,
+              skipped_cap: result.skipped_cap,
+              legacy_fallback: result.legacy_fallback,
+              fanout_max: fanoutMax,
+              score,
+            }) + '\n');
+          } else if (!result.legacy_fallback) {
+            console.log(
+              `[dispatch] fanout: ${result.dispatched.length} dispatched, ` +
+              `${result.skipped_fresh.length} fresh, ${result.skipped_cap.length} capped ` +
+              `(score=${score}, max=${fanoutMax})`,
+            );
           }
         } else {
           // Small targeted plan — submit individual handlers per step.

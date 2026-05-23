@@ -27,7 +27,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'capture']);
+const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -40,6 +40,12 @@ const CLI_ONLY_SELF_HELP = new Set([
   'models',
   'cache',
   'brainstorm', 'lsd',
+  // v0.39.3.0 WARN-5: capture's detailed HELP constant
+  // (src/commands/capture.ts:90+) was unreachable because the dispatcher's
+  // generic short-circuit (printCliOnlyHelp at :204-208) fired before
+  // runCapture saw --help. brainstorm + lsd were already in the set;
+  // capture was the holdout.
+  'capture',
   // v0.37 fix wave (Lane D.4 + CDX2-12): sync's --no-embed flag was
   // unreachable via help because the dispatcher's generic CLI-only
   // short-circuit fired before runSync could print its own usage block.
@@ -745,6 +751,11 @@ async function handleCliOnly(command: string, args: string[]) {
   }
 
   // Commands that don't need a database connection
+  if (command === 'schema') {
+    const { runSchema } = await import('./commands/schema.ts');
+    await runSchema(args);
+    return;
+  }
   if (command === 'init') {
     const { runInit } = await import('./commands/init.ts');
     await runInit(args);
@@ -1064,6 +1075,17 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'sync' && (args.includes('--help') || args.includes('-h'))) {
     const { runSync } = await import('./commands/sync.ts');
     await runSync(null as any, args);
+    return;
+  }
+
+  // v0.39.3.0 WARN-5: same pattern for `capture --help`. CLI_ONLY_SELF_HELP
+  // now includes 'capture' so the generic short-circuit at :101 stays out
+  // of the way, but the dispatch case at :1229 still needs an engine. The
+  // pre-engine-bind branch here exposes the HELP constant without requiring
+  // a configured brain (fresh-tmpdir parity with brainstorm/lsd/sync).
+  if (command === 'capture' && (args.includes('--help') || args.includes('-h'))) {
+    const { runCapture } = await import('./commands/capture.ts');
+    await runCapture(null, args);
     return;
   }
 
@@ -1662,6 +1684,15 @@ TOOLS
                                      See also: autopilot --install (continuous daemon).
   check-resolvable [--json] [--fix]  Validate skill tree (reachability/MECE/DRY)
   report --type <name> --content ... Save timestamped report to brain/reports/
+
+BRAIN (capture / ideate / explore — v0.37/v0.38)
+  capture [content] [--file PATH]    Single entrypoint for getting content into the brain
+        [--stdin] [--slug s] [--type t]   Inline content / file / stdin; writes to inbox/ by default
+        [--source ID] [--quiet|--json]    Multi-source brains: route to a non-default source
+  brainstorm <question> [--json]     Bisociation idea generator (hybrid search + far-set + judge)
+        [--save|--no-save] [--limit N]
+  lsd <question> [--json]            Lateral Synaptic Drift: inverted-judge brainstorm
+        [--save|--no-save] [--limit N]    rewarding far-from-obvious + axiomatic inversions
 
 SOURCES (multi-repo / multi-brain)
   sources list                       Show registered sources

@@ -25,6 +25,8 @@ import type { BrainEngine } from '../engine.ts';
 import { chat as defaultChat, embedQuery, type ChatResult, type ChatOpts } from '../ai/gateway.ts';
 import { hybridSearch, hybridSearchCached } from '../search/hybrid.ts';
 import { fetchFar, type CloseRef, type FarPage } from './domain-bank.ts';
+import { StructuredAgentError } from '../errors.ts';
+import { classifyBrainstormError } from './error-classify.ts';
 import {
   runJudge,
   BRAINSTORM_JUDGE_CONFIG,
@@ -469,17 +471,57 @@ const DEFAULT_PARALLELISM = 4;
  * `gbrain lsd`) calls this with the question + profile; renders the result
  * via formatBrainstormMarkdown; optionally saves via put_page.
  */
+/**
+ * v0.39.3.0 WARN-10 + CV11 — Public entry point. Wraps the impl in a
+ * single try/catch that classifies Postgres SQLSTATE 57014
+ * (query_canceled) into a `StructuredAgentError` with code
+ * 'brainstorm_timeout'. Covers EVERY internal SQL site (hybrid search,
+ * domain bank fetch, prefix enumeration, embedding fetch, save phase)
+ * by virtue of being the single wrap at the function boundary.
+ *
+ * Non-57014 errors rethrow unchanged so unrelated bug classes (OAuth,
+ * AI gateway, network) keep their natural shape — codex F#20: catching
+ * only the 57014 class is honest classification, NOT broad swallowing.
+ *
+ * Per A3 (plan-eng-review): reuses `StructuredAgentError` from
+ * src/core/errors.ts (the v0.19.0 envelope every new agent-facing
+ * surface uses) rather than introducing a new BrainstormError class.
+ */
 export async function runBrainstorm(
   engine: BrainEngine,
   config: { embedding_model?: string; emotional_weight?: { user_holder?: string } },
   opts: BrainstormOptions
 ): Promise<BrainstormResult> {
-  // T10: install a gateway-layer BudgetTracker scope around the whole run
-  // so every gateway.chat / embed call (the cross generations + judge +
-  // question embed) auto-records cost via the AsyncLocalStorage from T3.
-  // The cap mirrors the orchestrator's maxCostUsd so the gateway can
-  // hard-fail via BudgetExhausted(reason:'cost') if a single under-
-  // estimated call leaks past the ceiling (TX1).
+  // v0.39.3.0 (Phase 5, CV11+T4): outer try/catch around the orchestrator
+  // body classifies SQLSTATE 57014 (query_canceled — covers
+  // statement_timeout, lock_timeout, user-cancel) into a typed
+  // StructuredAgentError with code='brainstorm_timeout'. Non-57014 errors
+  // (including BudgetExhausted from the inner BudgetTracker wrap) pass
+  // through unchanged. Per A3: reuses StructuredAgentError (the v0.19.0
+  // envelope) rather than introducing a new BrainstormError class.
+  try {
+    return await runBrainstormImpl(engine, config, opts);
+  } catch (err) {
+    // classifyBrainstormError returns the original error unchanged when
+    // it's NOT a 57014 cancel; otherwise returns a typed
+    // StructuredAgentError ready to throw.
+    throw classifyBrainstormError(err);
+  }
+}
+
+async function runBrainstormImpl(
+  engine: BrainEngine,
+  config: { embedding_model?: string; emotional_weight?: { user_holder?: string } },
+  opts: BrainstormOptions,
+): Promise<BrainstormResult> {
+  // v0.39.0.0 T10: install a gateway-layer BudgetTracker scope around the
+  // whole run so every gateway.chat / embed call (the cross generations +
+  // judge + question embed) auto-records cost via the AsyncLocalStorage
+  // from T3. The cap mirrors the orchestrator's maxCostUsd so the gateway
+  // can hard-fail via BudgetExhausted(reason:'cost') if a single under-
+  // estimated call leaks past the ceiling (TX1). BudgetExhausted is NOT
+  // SQLSTATE 57014, so the outer classifyBrainstormError lets it pass
+  // through with its original shape (which the CLI formatter renders).
   const _runTracker = new BudgetTracker({
     label: `brainstorm.${opts.profile?.label ?? 'brainstorm'}`,
     maxCostUsd: opts.maxCostUsd ?? 5,

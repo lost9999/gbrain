@@ -480,6 +480,24 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     throw new Error(hint);
   }
 
+  // v0.39 T1.5: load active pack ONCE at sync entry; pass to every per-file
+  // importFile call below. Codex perf finding #7: per-file loadActivePack adds
+  // disk/YAML/hash overhead × thousands of files. Best-effort: pack load
+  // failure falls through to legacy inferType (parity preserved).
+  let syncActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
+  try {
+    const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
+    const { loadConfig } = await import('../core/config.ts');
+    const resolved = await loadActivePack({
+      cfg: loadConfig(),
+      remote: false, // sync is always a trusted CLI / autopilot caller
+      sourceId: opts.sourceId,
+    });
+    syncActivePack = { page_types: resolved.manifest.page_types };
+  } catch {
+    syncActivePack = undefined;
+  }
+
   // v0.28: source-aware re-clone branch. When the source has a remote_url
   // recorded (i.e. it was registered via `sources add --url`), the on-disk
   // clone is auto-managed. validateRepoState classifies the on-disk state;
@@ -777,7 +795,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // Reimport at new path (picks up content changes)
       const filePath = join(repoPath, to);
       if (existsSync(filePath)) {
-        const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId });
+        const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
         if (result.status === 'imported') chunksCreated += result.chunks;
       }
       pagesAffected.push(newSlug);
@@ -841,7 +859,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // / addLink) target (sourceId, slug). Pre-fix the schema DEFAULT
         // 'default' was applied even for non-default sources, fabricating
         // duplicate rows that crashed bare-slug subqueries with Postgres 21000.
-        const result = await importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId });
+        const result = await importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
           pagesAffected.push(result.slug);

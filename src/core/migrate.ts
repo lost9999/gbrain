@@ -3716,9 +3716,9 @@ export const MIGRATIONS: Migration[] = [
   {
     version: 80,
     name: 'takes_unresolvable_quality_v0_37_2_0',
-    // v0.37.2.0 hotfix — accepts quality='unresolvable' as a 4th valid
-    // resolution state. Unblocks production grading scripts that write the
-    // 4th verdict type (the judge in grade-takes returns
+    // v0.37.2.0 hotfix (master) — accepts quality='unresolvable' as a 4th
+    // valid resolution state. Unblocks production grading scripts that write
+    // the 4th verdict type (the judge in grade-takes returns
     // correct|incorrect|partial|unresolvable, but v37's CHECKs only allowed
     // the first three).
     //
@@ -3731,23 +3731,15 @@ export const MIGRATIONS: Migration[] = [
     //       re-add with the wider value list (named explicitly this time
     //       so future widening targets a known name).
     //
-    // Existing rows with (NULL, NULL), ('correct', true), ('incorrect',
-    // false), ('partial', NULL) all satisfy both new CHECKs unchanged.
-    //
-    // ALTER TABLE ADD CONSTRAINT acquires AccessExclusiveLock while it
-    // validates existing rows. On a 36K-row takes table this is sub-second;
-    // larger tables would want NOT VALID + VALIDATE CONSTRAINT, deferred.
-    //
-    // Renumbered v74→v79→v80 during successive master merges: master's
-    // v0.36.1.0 calibration + v0.36.3.0 + autonomous-remediation claimed
-    // v68-v78, then v0.37.1.0 claimed v79.
+    // v0.38 note: master's v80 (this migration) shipped to master between
+    // when this branch cut and the v0.38 ship. The v0.38 schema-pack
+    // migrations renumbered to v81 + v82 to land cleanly above it. Order
+    // matters because v80 drops + re-adds takes_resolved_quality_values
+    // and v81 will drop takes_kind_check — both touch the takes table but
+    // different constraints, no ordering hazard between them.
     idempotent: true,
     sql: `
       -- (b) Drop both possible names for the column-level CHECK:
-      -- v37's auto-generated takes_resolved_quality_check (Postgres default
-      -- for inline ADD COLUMN CHECK) and the explicit
-      -- takes_resolved_quality_values name we re-add below (idempotent on
-      -- re-run).
       ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolved_quality_check;
       ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolved_quality_values;
       ALTER TABLE takes ADD CONSTRAINT takes_resolved_quality_values CHECK (
@@ -3812,32 +3804,7 @@ export const MIGRATIONS: Migration[] = [
   {
     version: 82,
     name: 'subagent_tool_executions_stable_id',
-    // v0.38 Slice 1 — D11 stable-ID columns. The pre-v81 reconciliation key
-    // for crash-replay was `(job_id, tool_use_id)` where tool_use_id came from
-    // the Anthropic Messages API. That was load-bearing for the v0.15 crash-
-    // replay guarantee but tied the loop to Anthropic-direct. The provider-
-    // agnostic loop assigns its own ordinal at FIRST observation of a tool
-    // call in a turn; that ordinal + gbrain_tool_use_id (uuid v7) become the
-    // canonical reconciliation key. The provider's own tool_use_id stays as a
-    // side channel for debugging.
-    //
-    // Migration shape:
-    //   - ordinal INTEGER NULL: legacy rows have NULL; new writes always set
-    //     a value. UNIQUE on (job_id, message_idx, ordinal) treats multiple
-    //     NULL ordinals as distinct (Postgres semantics), so legacy rows
-    //     don't collide with each other or with new writes.
-    //   - gbrain_tool_use_id UUID NULL: same NULL semantics; populated at
-    //     write time post-Slice-1, NULL on legacy rows.
-    //   - Existing constraint uniq_subagent_tools_use_id (job_id, tool_use_id)
-    //     is preserved — provider IDs stay deduplicated within a job.
-    //   - The read-time D5 shim recomputes a stable key for legacy rows from
-    //     (job_id, message_idx, content_blocks index, tool_name); no data
-    //     migration needed.
-    //
-    // ADD COLUMN with no DEFAULT (NULL) is metadata-only on Postgres 11+ and
-    // PGLite 17.5 — instant on tables of any size. The UNIQUE constraint
-    // builds a partial index; on a typical brain with ~hundreds of subagent
-    // rows this is sub-millisecond.
+    // (master v0.38.1.0; see end of conflict marker block for full body)
     idempotent: true,
     sql: `
       ALTER TABLE subagent_tool_executions
@@ -3856,10 +3823,6 @@ export const MIGRATIONS: Migration[] = [
       END$$;
     `,
     sqlFor: {
-      // PGLite doesn't support DO blocks; pglite-schema.ts CREATE TABLE
-      // already includes the constraint on fresh installs, so this migration
-      // is a no-op when the constraint exists. DROP-IF-EXISTS + ADD pattern
-      // is idempotent and rebuilds the UNIQUE index (instant on small tables).
       pglite: `
         ALTER TABLE subagent_tool_executions
           ADD COLUMN IF NOT EXISTS ordinal INTEGER;
@@ -3876,21 +3839,7 @@ export const MIGRATIONS: Migration[] = [
   {
     version: 83,
     name: 'mcp_spend_reservations',
-    // v0.38 Slice 2 — D3 + codex P2 — reserve-then-settle budget pattern.
-    //
-    // The pre-v82 spend-tracking flow was: take the call, sum mcp_spend_log,
-    // refuse next call when over cap. Race condition: two concurrent agents
-    // from the same client both pre-flight pass at $2 of $5 cap, both spend,
-    // both bust the cap. This table holds in-flight reservations under
-    // pg_advisory_xact_lock(client_id) so the SUM-then-INSERT is atomic.
-    //
-    // Lifecycle:
-    //   pending  → settled  (call returned; actual_cents recorded)
-    //   pending  → expired  (call crashed; sweeper marks; actual=0)
-    //
-    // The TTL sweeper runs on every reserve (cheap when no expired rows).
-    // Partial index on (status, expires_at) WHERE status='pending' keeps
-    // the sweeper fast even when the settled history grows large.
+    // (master v0.38.1.0 — full body in merged region)
     idempotent: true,
     sql: `
       CREATE TABLE IF NOT EXISTS mcp_spend_reservations (
@@ -3914,26 +3863,19 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 84,
+    name: 'oauth_clients_budget_usd_per_day',
+    // (master v0.38.1.0 — full body in merged region)
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS budget_usd_per_day NUMERIC(10, 2) NULL;
+    `,
+  },
+  {
     version: 85,
     name: 'oauth_clients_agent_binding',
-    // v0.38 Slice 3 — D13 + codex P1 + P2 — registration-time binding for
-    // OAuth clients that hold the `agent` scope. The binding fields are
-    // each-or-nothing: if the client's allowed_scopes includes 'agent', the
-    // registrar MUST pass all five binding flags. The submit_agent op
-    // validates each param against the binding row at dispatch time.
-    //
-    //   - bound_tools TEXT[]: subset of brain-safe ops this client may
-    //     reference in submit_agent allowed_tools.
-    //   - bound_source_id TEXT: which source (database axis) the agent
-    //     writes to. FK to sources.id with ON DELETE SET NULL so a
-    //     source-delete doesn't dangling-reference the client.
-    //   - bound_brain_id TEXT: which mounted brain (multi-brain installs).
-    //   - bound_slug_prefixes TEXT[]: put_page namespace allowlist.
-    //   - bound_max_concurrent INTEGER: per-client concurrency cap on
-    //     in-flight subagent jobs.
-    //
-    // All NULL on pre-v84 clients. The submit_agent op refuses dispatch
-    // when scope='agent' is present but bindings are NULL — opt-in only.
+    // (master v0.38.1.0 — full body in merged region)
     idempotent: true,
     sql: `
       ALTER TABLE oauth_clients
@@ -3954,7 +3896,6 @@ export const MIGRATIONS: Migration[] = [
               FOREIGN KEY (bound_source_id)
               REFERENCES sources(id) ON DELETE SET NULL;
           EXCEPTION WHEN others THEN
-            -- sources table may not exist on minimal installs; skip silently.
             NULL;
           END;
         END IF;
@@ -3976,46 +3917,22 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 84,
-    name: 'oauth_clients_budget_usd_per_day',
-    // v0.38 Slice 2 — D2 + D3 — per-OAuth-client daily budget cap.
-    //
-    // Pre-v84 the daily cap lived in a per-search-image config key. This
-    // column makes it a first-class property of each OAuth client and lets
-    // `gbrain auth register-client --budget-usd-per-day N` persist the cap
-    // alongside scope. NULL = no cap (current pre-v84 behavior).
-    //
-    // Column-only; metadata-only on Postgres 11+ and PGLite 17.5.
-    idempotent: true,
-    sql: `
-      ALTER TABLE oauth_clients
-        ADD COLUMN IF NOT EXISTS budget_usd_per_day NUMERIC(10, 2) NULL;
-    `,
-  },
-  {
     version: 86,
     name: 'page_links_view_alias',
-    // v0.39 — pglite-engine.ts and postgres-engine.ts both query a relation
-    // named `page_links` (LEFT JOIN page_links pl ON pl.to_page_id = p.id —
-    // see pglite-engine.ts:896 / postgres-engine.ts:959). The canonical
-    // table has always been `links`. This migration installs a `page_links`
-    // VIEW that aliases the table so brains initialized before the v0.39
-    // schema bundle pick up the alias on upgrade.
+    // v0.39.0.0 schema-cathedral wave. Renumbered v81→v86 during the
+    // master-merge of v0.38.0.0 ingestion cathedral + v0.38.1.0 agent loop
+    // (master claimed v81-v85). page_links view alias is idempotent so
+    // brains that already ran it under shanghai-v3's v81 number are safe.
     //
-    // Fresh installs already get the view via the embedded schema bundle.
-    // This migration is idempotent (CREATE OR REPLACE VIEW) so re-running
-    // is safe on either engine.
+    // pglite-engine.ts and postgres-engine.ts both query a relation named
+    // `page_links` (see pglite-engine.ts:896 / postgres-engine.ts:959). The
+    // canonical table has always been `links`. This view aliases the table
+    // so brains initialized before the v0.38 schema bundle pick up the
+    // alias on upgrade.
     //
-    // Discovered during the brainstorm-cathedral wave (v0.39.0.0) when the
-    // E2E test had to workaround the missing view to exercise the resume
-    // path. Originally numbered v81; renumbered to v86 during merge with
-    // master's v0.38 cathedrals (provenance / subagent / spend / oauth
-    // binding) which claimed v81-v85.
-    //
-    // Narrow projection (id, from_page_id, to_page_id) so the view does not
-    // depend on columns added in later migrations (link_source,
-    // origin_page_id, resolution_type) — keeps ALTER TABLE DROP COLUMN
-    // and the bootstrap forward-reference probes unblocked on legacy brains.
+    // Narrow projection (id, from_page_id, to_page_id) so the view doesn't
+    // depend on later-added columns — keeps DROP COLUMN + bootstrap probes
+    // unblocked on legacy brains.
     sql: `
       CREATE OR REPLACE VIEW page_links AS
         SELECT id, from_page_id, to_page_id FROM links;
@@ -4023,8 +3940,84 @@ export const MIGRATIONS: Migration[] = [
   },
   {
     version: 87,
+    name: 'takes_kind_drop_check',
+    // v0.39.0.0 schema-cathedral wave (T3 + codex T10 fix). Renumbered
+    // v80→v81→v82→v87 across successive master merges. Final renumber
+    // landed it after master's v0.38.1.0 agent-loop bundle (v81-v85).
+    //
+    // Pre-v0.38: `takes.kind` was enforced by a DB CHECK constraint
+    // CHECK (kind IN ('fact','take','bet','hunch')) at the original
+    // table-creation migration (v41 / v48 in pre-renumber numbering).
+    // The same closed enum was duplicated as a TS type union.
+    //
+    // v0.38 opens the type surface so schema packs declare allowed kinds
+    // at runtime against the active pack's `annotation` primitive
+    // `takes_kinds:` field. This migration drops the DB CHECK; runtime
+    // validation in src/core/schema-pack/registry.ts takes over.
+    //
+    // Codex F10: dropping the DB CHECK without also widening the TS
+    // type "moves inconsistency around" — old clients and raw SQL could
+    // poison rows that runtime-validate cleanly. Both layers move
+    // together: this migration + src/core/engine.ts + src/core/takes-fence.ts
+    // already widened to `string`.
+    //
+    // Idempotent: `IF EXISTS` on both engines. PGLite supports
+    // ALTER TABLE DROP CONSTRAINT IF EXISTS (standard SQL).
+    idempotent: true,
+    sql: `
+      ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_kind_check;
+    `,
+  },
+  {
+    version: 88,
+    name: 'eval_candidates_schema_pack_per_source',
+    // v0.39.0.0 schema-cathedral wave (T4 + T28 + E10 + E11 codex fold).
+    // Renumbered v81→v82→v83→v88 across successive master merges. Final
+    // renumber landed it after master's v0.38.1.0 agent-loop bundle.
+    //
+    // Adds `eval_candidates.schema_pack_per_source JSONB` so `gbrain
+    // eval replay` reproduces the EXACT per-source closure that the
+    // captured query ran against. Without this, a year-old replay
+    // against an evolved pack returns different rows than the original
+    // capture — eval becomes a moving target.
+    //
+    // Shape (E11 inline canonical snapshot):
+    //   {
+    //     "<source_id>": {
+    //       "pack_name": "garry-pack",
+    //       "pack_version": "1.2.0",
+    //       "manifest_sha8": "ab12cd34",
+    //       "alias_closure_resolved": {"person": ["person","researcher"], ...}
+    //     },
+    //     ...
+    //   }
+    //
+    // Inline snapshot (E11): captures the FULL resolved alias graph at
+    // query time so replay is self-contained — no dependency on the
+    // pack file still existing in ~/.gbrain/schema-packs/. ~1KB per row
+    // for a typical 50-type pack; ~10MB/year for a heavy user (10K
+    // captured queries). Acceptable storage cost for permanent replay
+    // reliability.
+    //
+    // Codex F8 (replay version-mismatch policy): replay fails closed by
+    // default when captured pack identity drifts from the active. Pass
+    // --use-captured-snapshot flag to replay against the inline closure
+    // anyway.
+    //
+    // Pack identity = `<pack-name>@<version>+<manifest_sha8>` (codex F7).
+    //
+    // ADD COLUMN with no DEFAULT (NULL) is metadata-only on Postgres 11+
+    // and PGLite 17.5; instant on tables of any size.
+    idempotent: true,
+    sql: `
+      ALTER TABLE eval_candidates
+        ADD COLUMN IF NOT EXISTS schema_pack_per_source JSONB NULL;
+    `,
+  },
+  {
+    version: 89,
     name: 'sources_github_repo_index',
-    // v0.40 Federated Sync v2 (D13): partial expression index on
+    // v0.41 Federated Sync v2 (D13): partial expression index on
     // sources.config->>'github_repo' so the new POST /webhooks/github
     // handler's source-by-repo lookup uses an index instead of a sequential
     // scan. Sources is small today (<100 rows in practice) so the impact is
@@ -4036,10 +4029,10 @@ export const MIGRATIONS: Migration[] = [
     // PGLite support partial expression indexes; no engine-specific shape.
     // Idempotent (IF NOT EXISTS).
     //
-    // Plan called this v81 originally; renumbered to v87 because master's
-    // v0.38/v0.39 cathedrals filled v81-v86 first. Bootstrap probes mirror
-    // the v0.22.6.1 pattern (applyForwardReferenceBootstrap) so legacy
-    // brains pick up the index through initSchema() too.
+    // Plan called this v81 originally; renumbered through v87 → v89 across
+    // successive master merges. Bootstrap probes mirror the v0.22.6.1
+    // pattern (applyForwardReferenceBootstrap) so legacy brains pick up the
+    // index through initSchema() too.
     sql: `
       CREATE INDEX IF NOT EXISTS sources_github_repo_idx
         ON sources ((config->>'github_repo'))

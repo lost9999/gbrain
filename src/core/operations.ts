@@ -538,11 +538,48 @@ const put_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
+    // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
+    // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
+    // MCP callers (ctx.remote !== false) have their values OVERRIDDEN with
+    // server stamps below; the params are accepted on the wire only so the
+    // op schema stays uniform across transports. Audit-trail spoofing is
+    // closed structurally — clients cannot poison source_kind labels.
+    source_kind: { type: 'string', required: false, description: 'Ingestion channel taxonomy (capture-cli | put_page | webhook | …). Remote callers: SERVER-STAMPED, client value ignored.' },
+    source_uri: { type: 'string', required: false, description: 'Original URI/path/message-id the event carried. Remote callers: SERVER-STAMPED null.' },
+    ingested_via: { type: 'string', required: false, description: 'Richer label paired with source_kind. Remote callers: SERVER-STAMPED.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+
+    // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
+    // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
+    // autopilot, dream cycle, file watcher) may populate source_kind /
+    // source_uri / ingested_via from their own state. Anything else
+    // (HTTP MCP, stdio MCP, subagent) gets the server-stamped
+    // `mcp:put_page` regardless of what was passed.
+    //
+    // Closes the spoofing surface CV6 identified: pre-fix a write-scope
+    // OAuth token could send `source_kind: 'capture-cli'` to poison the
+    // audit trail. Fail-closed: `ctx.remote === false` is the ONLY truthy
+    // condition that admits client-supplied provenance.
+    let provenanceKind: string | null;
+    let provenanceUri: string | null;
+    let provenanceVia: string | null;
+    if (ctx.remote === false) {
+      // Trusted local caller: honor the client params (may be null/undefined
+      // for legacy local callers that don't set them).
+      provenanceKind = (p.source_kind as string | undefined) ?? null;
+      provenanceUri = (p.source_uri as string | undefined) ?? null;
+      provenanceVia = (p.ingested_via as string | undefined) ?? null;
+    } else {
+      // Remote caller or unset trust: server stamps. Mirrors the existing
+      // write-through stamping at the file-side (~:637).
+      provenanceKind = 'mcp:put_page';
+      provenanceUri = null;
+      provenanceVia = 'mcp:put_page';
+    }
 
     // Subagent namespace enforcement (v0.15+). Runs BEFORE the dry-run
     // short-circuit so preview calls surface the same rejection. Confines
@@ -588,30 +625,85 @@ const put_page: Operation = {
     // default-source clobber path. importFromContent already accepts
     // opts.sourceId (PR #707/#757 engine work); previously the op handler
     // just didn't pass it.
+    // v0.39 T1.5: load active pack ONCE per put_page invocation; thread to
+    // parseMarkdown via importFromContent so type inference honors user-defined
+    // page_types. Best-effort: pack load failure falls back to legacy inferType
+    // (parity gate preserved). Federated-read closure correction is T19's scope.
+    let activePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
+    try {
+      const { loadActivePack } = await import('./schema-pack/load-active.ts');
+      const { loadConfig } = await import('./config.ts');
+      const resolved = await loadActivePack({
+        cfg: loadConfig(),
+        remote: ctx.remote === false ? false : true,
+        sourceId: ctx.sourceId,
+      });
+      activePack = { page_types: resolved.manifest.page_types };
+    } catch {
+      // Pack load failed; fall through to legacy inferType behavior.
+      activePack = undefined;
+    }
     const result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
       ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+      // v0.39.0.0 T1.5: pack-aware type inference (loaded above; legacy
+      // inferType behavior when undefined).
+      ...(activePack ? { activePack } : {}),
+      // v0.39.3.0 provenance write-through (WARN-8). Trust-filtered values
+      // computed above; ingested_at is server-stamped at the engine layer.
+      // Null-valued fields signal "no provenance write this call" and the
+      // engine's COALESCE-preserve UPDATE keeps the prior first-write
+      // record intact (CV12 audit-trail survival).
+      source_kind: provenanceKind,
+      source_uri: provenanceUri,
+      ingested_via: provenanceVia,
     });
 
-    // v0.38 put_page write-through:
+    // v0.39 T13 — auto-prompt on first unknown-type write.
+    //
+    // Contract (codex finding #8 honored — 7 cases covered):
+    //   - TTY callers: stderr prompt fires once per unique unknown type;
+    //     subsequent writes with the same type silently append to
+    //     candidate audit.
+    //   - Non-TTY callers: ALWAYS succeed; silently append to candidate
+    //     audit. NEVER block. Critical regression test:
+    //     test/put-page-unknown-type-prompt.test.ts pins this.
+    //   - Subagent / MCP / claw-test / autopilot all go through here;
+    //     non-TTY contract preserves their semantics.
+    //   - Pack-load failures (activePack undefined) skip the gate entirely
+    //     since "unknown" has no meaning without a pack reference.
+    if (activePack && result.status === 'imported') {
+      try {
+        const pageType = (result as { page?: { type?: string } }).page?.type ?? null;
+        const knownTypes = new Set(activePack.page_types.map((t) => t.name));
+        if (pageType && !knownTypes.has(pageType)) {
+          const { logSchemaEvent } = await import('./schema-events.ts');
+          logSchemaEvent({
+            verb: 'put_page:unknown_type',
+            outcome: 'success',
+            flags: [`type=${pageType.slice(0, 32)}`, `slug=${slug.slice(0, 64)}`],
+          });
+          if (process.stderr.isTTY && ctx.remote === false) {
+            console.error(
+              `[schema] put_page wrote type=\`${pageType}\` which isn't in active pack \`${activePack.page_types.length ? '<configured>' : 'gbrain-base'}\`. ` +
+              `Run \`gbrain schema review-candidates\` to promote or ignore.`,
+            );
+          }
+        }
+      } catch {
+        // best-effort; never block put_page
+      }
+    }
+
+    // v0.38 put_page write-through (ingestion cathedral):
     // After importFromContent succeeds, if `sync.repo_path` resolves to a
     // real directory, persist the markdown file to disk alongside the DB
-    // row. Closes the drift class where DB and file diverged after every
-    // put_page call (the v0.35.6.0 phantom-redirect pass exists because
-    // of this drift). Failures are non-fatal — log but don't roll back
-    // the DB write, which is the durable record. Subsequent sync runs
-    // reconcile if needed.
+    // row. Failures non-fatal — DB write is durable; subsequent sync
+    // reconciles drift.
     //
     // Trust gating:
     //   - Subagent sandbox (viaSubagent without allowedSlugPrefixes) → DB-only.
-    //     Sandbox writes live in wiki/agents/<id>/ and don't earn a file slot.
-    //   - All other writes (local CLI, MCP write-scope agents, trusted
-    //     workspace subagents) → write-through.
-    //
-    // The trusted-workspace path (synthesize/patterns) also runs its own
-    // reverseWriteRefs in synthesize.ts:reverseWriteRefs as part of the
-    // cycle phase. Both paths writing the same file is idempotent — the
-    // second writeFileSync overwrites with byte-identical content.
+    //   - All other writes → write-through.
     let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
@@ -623,17 +715,10 @@ const put_page: Operation = {
         } else if (!existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
           writeThrough = { written: false, skipped: 'repo_not_found' };
         } else {
-          // Pull the freshly-written page + tags from the engine so the
-          // markdown we serialize reflects the post-import state, not the
-          // pre-import parsedPage view (which lacks DB-derived fields like
-          // updated_at metadata).
           const sourceId = ctx.sourceId ?? 'default';
           const writtenPage = await ctx.engine.getPage(result.slug, { sourceId });
           if (writtenPage) {
             const tags = await ctx.engine.getTags(result.slug, { sourceId });
-            // Provenance stamp on the frontmatter so future sync round-trips
-            // know where this page came from. Local CLI writes get
-            // ingested_via='put_page'; MCP writes get 'mcp:put_page'.
             const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
             const md = serializePageToMarkdown(writtenPage, tags, {
               frontmatterOverrides: {
@@ -651,8 +736,6 @@ const put_page: Operation = {
           }
         }
       } catch (e) {
-        // Loud log; DB write NOT rolled back. The phantom-redirect pass
-        // catches lingering drift.
         const msg = e instanceof Error ? e.message : String(e);
         ctx.logger.warn(`[put_page] write-through failed for ${result.slug}: ${msg}`);
         writeThrough = { written: false, error: msg };

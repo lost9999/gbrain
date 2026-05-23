@@ -146,6 +146,27 @@ export interface GBrainConfig {
     oauth_client_id: string;
     oauth_client_secret?: string;
   };
+
+  /**
+   * v0.38 — active schema pack name (D13 tier 6 in the 7-tier resolution
+   * chain). The pack drives type inference, alias closure for search,
+   * link-verb regexes, expert-routing flags, and enrichment dispatch.
+   * Default: `gbrain-base` (reproduces pre-v0.38 hardcoded behavior).
+   *
+   * Resolution priority (highest → lowest, per D13):
+   *   1. Per-call SearchOpts.schema_pack (CLI-only; rejected for remote callers)
+   *   2. GBRAIN_SCHEMA_PACK env var
+   *   3. Per-source DB config `schema_pack.source.<id>`
+   *   4. Brain-wide DB config `schema_pack`
+   *   5. gbrain.yml `schema:` section
+   *   6. THIS field (~/.gbrain/config.json)
+   *   7. Default 'gbrain-base'
+   *
+   * `gbrain config set schema_pack <name>` writes the DB plane (tier 4);
+   * editing this file directly writes tier 6. Env var (tier 2) is the
+   * operator escape hatch.
+   */
+  schema_pack?: string;
 }
 
 /**

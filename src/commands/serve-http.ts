@@ -27,7 +27,7 @@ import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
-import { hasScope, ALLOWED_SCOPES_LIST } from '../core/scope.ts';
+import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
@@ -1083,12 +1083,33 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Register client from admin dashboard
   app.post('/admin/api/register-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
     try {
-      const { name, scopes, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
+      // v0.39.3.0 WARN-9 + CV12: accept BOTH `scopes` (admin SPA convention)
+      // AND `scope` (OAuth wire-format convention, singular). The pre-fix
+      // code destructured only `scopes` and used `scopes || 'read'` which:
+      //   - Silently ignored `scope` requests (always defaulted to 'read')
+      //   - Threw on array input because registerClientManual's parseScopeString
+      //     calls .split(' ') which arrays don't have
+      //   - Accepted `['read write']` (space-in-element bug shape codex flagged)
+      //     and other malformed inputs
+      // normalizeScopesInput handles all four valid shapes (string, string[],
+      // missing, empty) and rejects the rest with a structured 400.
+      const { name, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
+      const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      let scopeString: string;
+      try {
+        scopeString = normalizeScopesInput(rawScopes);
+      } catch (e) {
+        res.status(400).json({
+          error: 'invalid_scopes',
+          message: e instanceof Error ? e.message : String(e),
+        });
+        return;
+      }
       const grants = Array.isArray(grantTypes) && grantTypes.length > 0 ? grantTypes : ['client_credentials'];
       const uris = Array.isArray(redirectUris) ? redirectUris : [];
       const result = await oauthProvider.registerClientManual(
-        name, grants, scopes || 'read', uris,
+        name, grants, scopeString, uris,
       );
       // Public client (PKCE-only, no secret): NULL out client_secret_hash and
       // set auth method so the SDK's clientAuth middleware skips the hash-vs-
@@ -1577,6 +1598,30 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const authInfo = (req as Request & { auth?: AuthInfo }).auth as AuthInfo;
       const agentName = authInfo.clientName ?? authInfo.clientId;
 
+      // v0.39.3.0 BUG-2: outer try/catch ensures any unexpected throw
+      // returns a JSON envelope instead of leaking express's default HTML
+      // error page. Mirrors the MCP handler's F14 pattern (serve-http.ts
+      // F14 envelope around transport.handleRequest). The `!res.headersSent`
+      // guard (codex F#16) prevents a second-response attempt if the throw
+      // happens after the inner queue.add try/catch already responded.
+      try {
+
+      // v0.39.3.0 BUG-2: explicit null/undefined guard BEFORE body coercion.
+      // When the request has no body at all (no Content-Length header, no
+      // body-parser fed us anything), `req.body` is `undefined`. The pre-fix
+      // code's `else` branch called `Buffer.from(JSON.stringify(undefined),
+      // 'utf8')` — and `JSON.stringify(undefined) === undefined` (the
+      // literal, not the string), which makes `Buffer.from(undefined, 'utf8')`
+      // throw TypeError. Express's default error handler then served an HTML
+      // 500 page. Guard fires first to keep the response shape JSON.
+      if (req.body == null) {
+        res.status(400).json({
+          error: 'empty_body',
+          message: 'POST /ingest requires a non-empty body',
+        });
+        return;
+      }
+
       // Express raw() returns a Buffer. Decode as UTF-8; reject non-UTF-8
       // bytes loudly so callers know their payload was garbled.
       let body: Buffer;
@@ -1586,7 +1631,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         body = Buffer.from(req.body, 'utf8');
       } else {
         // express.json or urlencoded fired earlier in the chain and parsed
-        // for us. Re-serialize so we can hash and forward.
+        // for us. Re-serialize so we can hash and forward. The null/undefined
+        // case is already guarded above so JSON.stringify produces a real
+        // string here (objects round-trip, primitives become their JSON form).
         body = Buffer.from(JSON.stringify(req.body), 'utf8');
       }
 
@@ -1713,6 +1760,22 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           error: 'queue_submission_failed',
           message: msg,
         });
+      }
+
+      // v0.39.3.0 BUG-2: outer try/catch close — anything that throws BEFORE
+      // the inner queue.add try/catch lands here. The headersSent guard
+      // (codex F#16) skips the second-response attempt if the inner block
+      // already wrote a response and then threw on a downstream line (e.g.
+      // a logging side-effect after `res.status(202).json(...)`).
+      } catch (outerErr) {
+        const msg = outerErr instanceof Error ? outerErr.message : String(outerErr);
+        console.error('POST /ingest unexpected handler error:', msg);
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: 'internal_error',
+            message: msg,
+          });
+        }
       }
     },
   );
