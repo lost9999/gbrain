@@ -19,17 +19,27 @@ It's easier to ship a daemon that runs 24/7 to ingest, enrich, and consolidate t
 
 ## What this looks like
 
-A real example pulled verbatim from [BrainBench Cat 29](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md) — the same question, the same 164-page synthetic brain, judged 0-10 by Claude Haiku on accuracy + groundedness + utility.
+Pulled directly from `eval/reports/cat29-think-vs-search/2026-05-23-cat29.json` (the actual eval receipt; reproduce yourself via `bun eval/runner/cat29-think-vs-search.ts`). Same question, same brain, same retrieval pipeline. Judge: Claude Haiku 4.5, prompted to score 0-10 on accuracy + groundedness + utility.
 
-**Question:** *"Who works at the Horizon TECH 6 company? What roles do they hold?"*
+**Question (note the typo — "Acme AI 0" instead of "Acme CO 0"; the brain only contains the latter):**
 
-| | Typical personal-knowledge brain (top-K vector retrieval over chat sessions, what MemPalace / Mem0 / Hindsight ship) | GBrain `think` (same retrieval + synthesis + gap analysis) |
+```
+Has the ARR of the Acme AI 0 company grown over time? What were the readings?
+```
+
+| | Typical AI-memory stack (top-K vector retrieval, the shape MemPalace and most peer systems ship) | GBrain `think` |
 |---|---|---|
-| **What you get back** | Top retrieved pages with snippets:<br>1. `companies/horizon-tech-6` — "A embedding-providers company..."<br>2. `deal/horizon-tech-6-seed` — "raised $32M seed..."<br>3. Three people pages from other companies (Orbit Bio, Echo Robotics, Pulse Tech) | A written answer:<br>"None of the retrieved people pages list `companies/horizon-tech-6` as their employer. The company page describes Horizon TECH 6 as an embedding-providers company founded in 2024, with team size growing from 4 (2025-03-01) to 19 (2026-02-15), but does not name any individuals. The related deal page notes a $32M seed round led by `companies/widget-systems-1`, but names no Horizon TECH 6 employees." |
-| **Haiku judge score** | **1 / 10** | **9 / 10** |
-| **Why** | Retrieved the right company page but the three "people" returned actually work at other companies — a downstream agent reading these would hallucinate them as Horizon employees | Correctly identifies what the brain knows AND flags what it doesn't. No hallucination. Citations on every claim. |
+| **Answer returned** (verbatim from the receipt) | <pre>Top retrieved pages:<br>1. companies/acme-co-0 — # Acme CO 0 A eval-frameworks company. Founded 2020. Focus area: [[concepts/agent-memory]]. Working on ai-infrastructure. ## Facts \| since \| claim \| metric \| value \| unit \| period \| \|-------\|-----<br>2. companies/crater-systems-5 — # Crater SYSTEMS 5 A autonomous-picking company. Founded 2022. Focus area: [[concepts/agent-memory]]...<br>3. companies/pulse-cloud-29 ...</pre> | <pre>## Answer<br><br>The question asks about "Acme AI 0". The brain contains a page for **Acme CO 0** [companies/acme-co-0] — no entity named "Acme AI 0" appears in the retrieved results. Assuming Acme CO 0 is the intended target, its ARR has grown consistently across all three readings:<br><br>- **2025-01-15**: ARR = $119,737 [companies/acme-co-0]<br>- **2025-08-20**: ARR = $502,387 (≈4.2× the prior reading) [companies/acme-co-0]<br>- **2026-04-10**: ARR = $841,657 (≈1.68× the prior reading) [companies/acme-co-0]</pre> |
+| **Haiku judge score** | **0 / 10** | **9 / 10** |
+| **Judge verdict** (verbatim) | *"The search results retrieved pages for incorrect companies (Crater Systems, Pulse Cloud, Vector AI, Titan Labs) instead of 'Acme AI 0', failed to extract or display any ARR metric values, and provided no information about ARR growth trajectory."* | *"Answer correctly identifies all three ARR readings in chronological order with accurate values and demonstrates consistent growth trajectory, with only minor deduction for the unresolved name discrepancy (Acme AI 0 vs Acme CO 0) which is transparently flagged rather than ignored."* |
 
-Across five multi-page relational questions, `gbrain think` averages **5.60/10** vs raw search **1.60/10** — a **+4.00 point** Haiku-judged lift, with think winning 3 of 5 questions. The gap analysis ("brain doesn't know the answer to this part") is the part nobody else ships. Full Cat 29 receipt: [`docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md`](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md).
+Three things `gbrain think` did that a typical top-K retrieval cannot:
+
+1. **Caught the name typo.** The question asked about "Acme AI 0"; the brain only has "Acme CO 0." Think flagged this transparently rather than silently returning the closest match.
+2. **Walked the typed-claim Facts fence.** The synthesis combined three separate ARR readings on three different dates into a chronological trajectory with growth multipliers between them.
+3. **Cited every claim.** Every number gets a `[companies/acme-co-0]` citation pointing at the source page — no floating numbers.
+
+Across five multi-page relational questions in Cat 29, `gbrain think` averages **5.60/10** vs raw retrieval **1.60/10** — a **+4.00 point** Haiku-judged lift, with think winning 3 of 5 questions. Full receipt + the other four questions: [`docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md`](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md).
 
 ## Install
 
