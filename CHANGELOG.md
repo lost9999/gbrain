@@ -2,6 +2,45 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.3.0] - 2026-05-24
+
+**Six community bug-fix PRs land + the E2E suite stops lying about itself.** A fix-wave triage swept the 333-PR queue, closed 10 PRs as already-shipped (with credit, naming the commits + files), and bundled 6 real fixes from the community into one collector. Plus three E2E-suite reliability fixes that surfaced while getting the full Docker suite to 100% green.
+
+You can now run `gbrain init --help` from inside a directory with 1000+ markdown files without it silently overwriting your Supabase config with PGLite. Your Supabase brain stops auth-failing at the direct connection because the pooler-form `postgres.<ref>` username now gets stripped before deriving the direct URL. OpenAI embedding batches that hit the 1M-token TPM ceiling actually engage the recursive-halving safety net (the `Invalid 'input': maximum request size is 300000 tokens per request.` error message now matches the recognition regex; pre-fix it never fired). The dream-cycle's synthesize phase stops dying with `subagent job rejected: data.model "claude-sonnet-4-6" references an unknown provider` because the queue.add subagent validator now sees `anthropic:claude-sonnet-4-6` from a narrow prefix-fix at the call site.
+
+To turn it on: `gbrain upgrade`. The contributor closure comments include the exact commit SHA + file:line that already shipped each fix, so anyone who filed a duplicate or stale PR can verify the work landed.
+
+What you'd see in a concrete example. Pre-this-release: `gbrain init --help` from `~/Documents` (with 1500+ `.md` files inferred as a brain candidate) writes `engine: 'pglite'` + `database_path: ~/.gbrain/brain.pglite` to your real config, silently disconnecting you from Supabase. Post-fix: `--help` short-circuits before any state write; help text prints; config untouched. Same shape for the other five fixes: documented bugs, real repros, real fixes, real tests.
+
+Things to know about. (1) Two cross-file E2E reliability fixes in `scripts/run-e2e.sh`: per-file `pg_terminate_backend` flush kills stale connections from the prior bun process before the next file's `setupDB()` TRUNCATE races them, AND a hard 180s outer `gtimeout`/`timeout` cap so a wedged PGLite WASM call in beforeAll/afterAll can't pin the entire suite (this caught a real 30+ min wedge on `ingestion-roundtrip.test.ts` during the wave). (2) The `gbrain doctor` test in `test/e2e/mechanical.test.ts` now pins `--embedding-model openai:text-embedding-3-large` on its init step (was inheriting whatever the resolver picked from env keys, producing dim-mismatch warnings under sequential E2E) and `DELETE FROM sources WHERE id != 'default'` in beforeAll (was inheriting orphan `delta` source rows from prior files, producing `sync_freshness FAIL`).
+
+Credit to the 6 community contributors whose PRs landed: @mgunnin (x2: max_batch_tokens + isTokenLimitError regex), @brandonlipman (x2: connection-manager username strip + init --help guard), @jeremyknows (frontmatter-install-hook test isolation), @garrytan-agents (routing-eval intent-field guard). Plus 10 superseded PRs closed with credit (#798, #1083, #918, #1119, #602, #758, #539, #1287, #1117, #1125) — fix already on master via prior waves (v0.31.7 #804 + v0.36.1.1 #1182 + v0.38.2.0 #1297 + others); contributor closures cite each landing commit + file location.
+
+### Itemized changes
+
+**The 6 community fix-wave cherry-picks:**
+
+- **#924 (mgunnin):** `src/core/ai/recipes/openai.ts` gains `max_batch_tokens: 100_000` on the embedding touchpoint. Pre-fix OpenAI was the only recipe missing this cap; the recursive-halving safety net never engaged on token-dense pages (Discord exports, JSON dumps, code-heavy markdown), then retry storm and block the queue head. 100K estimated = ~150K real worst-case, safely under OpenAI's 300K per-request hard cap.
+- **#990 (mgunnin):** `src/core/ai/gateway.ts:1264` `isTokenLimitError` now matches `maximum request size.*tokens` so OpenAI's actual error string triggers recursive halving. Pre-fix the regex caught Voyage and generic shapes but not OpenAI's literal wording. Tests in `test/ai/adaptive-embed-batch.test.ts` pin the recognition.
+- **#761 (brandonlipman):** `src/core/connection-manager.ts:144-148` `deriveDirectUrl` now strips the `postgres.<ref>` pooler-form username down to bare `postgres` when synthesizing the Supabase direct URL. Pre-fix Supabase direct connections silently failed auth because they expect bare `postgres` (the `.<ref>` suffix is a pooler-routing-only thing). Tests in `test/connection-manager.serial.test.ts`.
+- **#762 (brandonlipman):** `src/commands/init.ts:13-16` adds a `--help`/`-h` short-circuit at the top of `runInit`. Pre-fix `gbrain init --help` from a directory with many `.md` files would fall through to smart-detection, scan cwd, then `saveConfig()` — silently overwriting any existing Postgres config with PGLite defaults. Confirmed in the wild on a 10K-page Supabase brain.
+- **#916 (jeremyknows):** `test/frontmatter-install-hook.test.ts` test isolation fix — uses `--local --get` instead of `--get` (which falls back to global config). Without this, developers with `core.hooksPath` set globally (dotfiles managers pointing at `~/.config/git/hooks`) see a deterministic FAIL.
+- **#1332 (garrytan-agents):** `src/core/routing-eval.ts` adds defensive guard so `loadRoutingFixtures({intent: undefined})` doesn't crash `gbrain doctor` with `undefined is not an object (evaluating s.toLowerCase)`. Fixture validation now reports malformed entries instead of crashing the whole doctor run.
+
+**Three E2E reliability fixes (surfaced during this wave):**
+
+- **`src/core/cycle/synthesize.ts:395-404`** narrow `anthropic:` prefix fix at the queue.add boundary. `resolveModel` returns the bare id from `TIER_DEFAULTS`/`DEFAULT_ALIASES` (e.g. `claude-sonnet-4-6`); the subagent validator requires `provider:model` and rejected with `unknown provider`, dropping synthesize to `status: fail` with `SYNTH_PHASE_FAIL`. Narrow conditional prefix at the call site (only when no colon AND starts with `claude-`) avoids changing the constants which would ripple across every `resolveModel` caller.
+- **`scripts/run-e2e.sh` per-file connection flush + outer timeout.** Two cross-file isolation hardenings: (1) `psql -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid != pg_backend_pid() AND datname = current_database()"` before each file kills idle connections from the prior bun process's pool, which were racing with the next file's `TRUNCATE CASCADE` and producing 'fixture pages disappear mid-test' failures; (2) hard 180s outer `gtimeout`/`timeout` cap so a PGLite WASM hang in beforeAll/afterAll can't wedge the entire suite. Both surfaced during the wave: 3 of 5 cross-file flakes caught by the connection flush; `ingestion-roundtrip` 30-min wedge caught by the outer timeout.
+- **`test/e2e/mechanical.test.ts` doctor test hardening.** Two fixes: pin `--embedding-model openai:text-embedding-3-large` on the init subprocess (was inheriting env-resolver defaults that produced dim-mismatch under sequential E2E); `DELETE FROM sources WHERE id != 'default'` in beforeAll (was inheriting orphan `delta` source rows from prior files, producing `sync_freshness FAIL`).
+
+### For contributors
+
+Wave triage process notes:
+- 333-PR queue evaluated via per-PR isolation runs + cross-reference against master HEAD (the load-bearing trick: read each PR's diff against its OWN base, not against current master, to see the actual intended change without v0.38-0.40 reverts contaminating the view).
+- 10 PRs closed-as-superseded with credit comments citing the landing commit SHA + file:line so contributors can verify the fix shipped. The contributor close template is captured in `~/.claude/plans/time-for-fix-wave-warm-narwhal.md`.
+- 2 mid-wave additional supersession discoveries (PR #1117 + PR #1125) caught via the `git log -S "configuredProviderIds" origin/master` pattern after master had already absorbed them via v0.36.1.1 #1182 (28-fix collector from 5 weeks ago); both closed with credit pointing at the absorbed commit.
+- Tests on the wave reached 117/117 files / 821/821 tests pass against fresh Docker pgvector container after fixing the cross-file flake class.
+
 ## [0.41.0.0] - 2026-05-24
 
 **Your 100-job subagent batch now actually completes.** A real user ran `gbrain jobs work --concurrency 10` against an Azure-hosted Anthropic endpoint, submitted 100 background jobs, and watched every single one dead-letter with `rate lease "anthropic:messages" full (8/8)`. The default cap of 8 starved 2 workers; every starved job got marked as a failure, hit `max_attempts = 3` after 3 lease-full bounces, and dead-lettered. This release turns minions from "a CLI you drive" into "a fleet you supervise" — submit a batch, walk away, come back to completed work.
