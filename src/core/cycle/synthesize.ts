@@ -723,8 +723,11 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
     create: async (params): Promise<Anthropic.Message> => {
       // Map Anthropic.MessageCreateParamsNonStreaming → gateway.ChatOpts.
       // `judgeSignificance` always sends string content + string system,
-      // but the adapter tolerates the array-of-blocks shape for future
-      // flexibility (same pattern as think/index.ts:607-615).
+      // and the adapter only TEXT-flattens the array-of-blocks shape —
+      // `tool_use`, `tool_result`, image, and other non-text blocks become
+      // empty strings. If a future caller wires tool-use or image content
+      // through this client, extend the mapping instead of relying on the
+      // current silent drop. Same pattern as think/index.ts:607-615.
       const messages = params.messages.map(m => ({
         role: m.role,
         content: typeof m.content === 'string'

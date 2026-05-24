@@ -55,14 +55,31 @@ for f in "${GUARDED_FILES[@]}"; do
     FAILED=1
   fi
 
-  # Match a value-shaped (NOT type-only) import of the SDK. The type-only form
+  # Match any value-shaped (NOT type-only) import of the SDK. The type-only form
   # `import type Anthropic from '@anthropic-ai/sdk'` is allowed for typing the
-  # adapter's Anthropic.Message return shape.
-  if grep -En "^\s*import\s+Anthropic\s+from\s+['\"]@anthropic-ai/sdk['\"]" "$f" 2>/dev/null; then
+  # adapter's Anthropic.Message return shape. Covers:
+  #   import Anthropic from '@anthropic-ai/sdk'         (default)
+  #   import { Anthropic } from '@anthropic-ai/sdk'     (named)
+  #   import Anthropic, { Other } from '@anthropic-ai/sdk' (default + named)
+  #   import { Anthropic as A } from '@anthropic-ai/sdk' (named-renamed)
+  #   import * as Anthropic from '@anthropic-ai/sdk'    (namespace)
+  #   const x = await import('@anthropic-ai/sdk')       (dynamic)
+  # Excludes ONLY the explicit type-only form `import type ... from '@anthropic-ai/sdk'`.
+  if grep -En "^\s*import\s+[^t][^y]*from\s+['\"]@anthropic-ai/sdk['\"]" "$f" 2>/dev/null \
+     | grep -v "^[0-9]\+:\s*import\s\+type\s" \
+     | grep .; then
     echo
     echo "ERROR: $f imports @anthropic-ai/sdk as a runtime value."
     echo "       Use \`import type Anthropic from '@anthropic-ai/sdk'\` for type-only"
     echo "       references to Anthropic.Message / Anthropic.MessageCreateParamsNonStreaming."
+    echo "       Route runtime chat calls through src/core/ai/gateway.ts."
+    FAILED=1
+  fi
+  # Dynamic import — also a value-shaped reference.
+  if grep -En "import\s*\(\s*['\"]@anthropic-ai/sdk['\"]" "$f" 2>/dev/null \
+     | grep -vE '^[0-9]+:\s*(//|\*)' | grep .; then
+    echo
+    echo "ERROR: $f dynamically imports @anthropic-ai/sdk."
     echo "       Route runtime chat calls through src/core/ai/gateway.ts."
     FAILED=1
   fi
