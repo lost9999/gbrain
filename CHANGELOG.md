@@ -113,6 +113,129 @@ New tests: `test/operations-fuzzy-source-scope.test.ts` (6 PGLite cases: scalar 
 `gbrain upgrade` runs migration v95 automatically. The migration is `CREATE INDEX CONCURRENTLY` on Postgres so it doesn't block other writers; the index is small (`~MB` even on 100K-page brains) and the dedup query becomes O(log n).
 
 ### To take advantage of v0.41.13.0
+## [0.41.10.1] - 2026-05-25
+
+**Background sweeps stop silently losing rows, `dream.*` config you set actually reaches the cycle, and switching embedding providers won't quietly corrupt your brain when env vars override the switch.** Three production reliability fixes landed in one wave, rebuilt from three closed community PRs (#1414, #1416, #1421 from `@garrytan-agents`) with structural improvements from `/plan-eng-review` + codex outside-voice review.
+
+You can now configure `dream.synthesize.session_corpus_dir` (and 6 other dream.* keys) via `gbrain config set` and have it actually reach the cycle phase that reads it. Pre-fix the cycle silently skipped with "no transcripts to process" even though the config wrote successfully to the DB. The `extract` and `sync` commands now retry batched inserts once on transient PgBouncer connection drops instead of losing the whole batch — closes a ~30% data-loss rate observed on 96K-page brains during heavy cycles. And `gbrain ze-switch` now refuses to start a schema transition when `GBRAIN_EMBEDDING_MODEL` is pinned to a model that disagrees with the target, instead of silently corrupting 716K chunks the way the original incident did.
+
+To turn it on: `gbrain upgrade`.
+
+What you'd see in a concrete example.
+
+- **Before:** Set `dream.synthesize.session_corpus_dir /Users/me/transcripts` via `gbrain config set`. Run `gbrain dream --phase extract_atoms`. It skips with "no transcripts to process" — config never reached the phase because `extract-atoms.ts` read via file-plane-only `loadConfig()`, not `loadConfigWithEngine(engine)`.
+- **After:** Same setup, the phase actually walks the directory.
+
+- **Before:** Run `gbrain extract all` on a brain hitting PgBouncer pool recycles. ~30% of batched inserts throw "No database connection: connect() has not been called" and silently drop 100 rows each — visible in stderr but easy to miss in a long run.
+- **After:** Same setup, transient connection errors trigger one 500ms retry. Stderr shows `[extract.links_fs] connection blip, retrying 100 rows in 500ms (Connection terminated unexpectedly)` and the retry succeeds. Snapshot-before-clear contract means the retry sends the same data even if the producer wrote more during the delay.
+
+- **Before:** `GBRAIN_EMBEDDING_MODEL=openai:text-embedding-3-large gbrain ze-switch --non-interactive --force`. Schema migrates to 2560-dim ZE columns. Embed sweep reads env, embeds with OpenAI's 1536-dim model, writes 1536d vectors into 2560d columns. Brain corrupts.
+- **After:** Same command refuses pre-apply with an ASCII warning box: schema not mutated, paste-ready `unset GBRAIN_EMBEDDING_MODEL` command surfaced. Apply with `--ignore-env-override` if you really mean it. The gate fires on `--resume` too, so there's no bypass path.
+
+Things to know about. **(1)** Idempotency upgrade for `extract_atoms`. The phase now checks "do any atoms already exist for this content hash?" before calling Haiku, replacing the date-stamped slug that caused duplicate atoms when re-discovered on a new day. Page-side and transcript-side both covered. Re-running the cycle on unchanged content produces zero new atoms; the original incident is closed. **(2)** Known limitation: if Haiku writes atom 1 of 3 then atom 2 throws, source-hash filter sees atom 1 exists and skips on next discovery — atoms 2+3 stay missing until content changes. Documented in TODOS.md as a v0.42+ per-atom idempotency follow-up. Rare in practice. **(3)** A new `embedding_env_override` doctor check runs every doctor pass: surfaces when `GBRAIN_EMBEDDING_MODEL` / `GBRAIN_EMBEDDING_DIMENSIONS` disagree with DB config so users see the drift before the embed sweep corrupts vectors. Wired into both local doctor and the HTTP MCP doctor surface.
+
+What we caught and fixed before merging. Codex outside-voice review caught 10 real correctness gaps in the plan:
+- `extract-atoms` was calling `engine.putPage(slug, page)` without sourceId — on non-default brain sources, atoms always wrote to `default` and the NOT EXISTS idempotency check became ineffective. Fixed: sourceId threaded through every putPage call.
+- The original `ze-switch` env-gate placement (post-apply warning) would have shipped the same 716K-chunk damage class. Fixed: gate fires BEFORE the snapshot write at line ~294, not just before runSchemaTransition at ~304. Test asserts ZERO setConfig calls fire on a refused apply.
+- `resumeRetrievalUpgrade` would have been a bypass path. Fixed: same gate on resume.
+- Discovery SQL would have crashed on pages with NULL content_hash. Fixed: `AND p.content_hash IS NOT NULL` filter added.
+- Discovery would have chewed its own dream-generated output. Fixed: `AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'` filter.
+- cycle.ts was passing `affectedSlugs = syncPagesAffected` only, missing pages just-written by the synthesize phase in the same cycle. Fixed: union of sync + synthesize affected slugs.
+- `ApplyResult` and `Check.issues` tagged unions/types needed extending to handle the new `refused` variant and `details.mismatches[]` shape. Fixed: typed properly.
+- The plan's "env wins for dream.*" claim was false — there are no GBRAIN_DREAM_* env vars. Fixed: dropped the false claim; precedence is `file > DB > defaults`.
+
+### Itemized changes
+
+**Phase 1: systemic dream.\* DB-config merge (`src/core/config.ts`)**
+
+- `loadConfigWithEngine()` sparse-merge block extended with 7 `dream.*` keys: `dream.synthesize.{session_corpus_dir, meeting_transcripts_dir, verdict_model, max_prompt_tokens, max_chunks_per_transcript}` + `dream.patterns.{lookback_days, min_evidence}`.
+- Precedence: file > DB > defaults per key. Parent objects (`cfg.dream`, `cfg.dream.synthesize`, `cfg.dream.patterns`) allocated defensively before assigning leaf keys.
+- Invalid DB int values fall back to "DB miss" (no throw).
+- `GBrainConfig` interface gains `dream?:` typed shape so consumers get TypeScript-level safety.
+
+**Phase 2: batch withRetry (`src/commands/extract.ts`, `src/core/retry-matcher.ts`)**
+
+- New exported pure primitive `withRetry<T>(fn, {onRetry?, delayMs?})` — single retry, 500ms default delay. Test seam via `delayMs: 0`.
+- New `logBatchRetry(label, snapshotLen, err, jsonMode)` helper shared across 6 flush sites.
+- All 6 `flush()` sites in `extract.ts` (lines ~519, 531, 614, 672, 840, 994) converted to `snapshot.slice()` BEFORE `batch.length = 0`. Error messages read `snapshot.length`, not the post-clear batch length.
+- Classifier is the existing `isRetryableConnError` from `src/core/retry-matcher.ts`. Extended in this wave with `GBrainError{problem: 'No database connection'}` typed shape recognition + the literal "No database connection" message pattern (closes the specific shape from PR #1416's reported incident).
+
+**Phase 3: extract_atoms idempotency + page discovery (`src/core/cycle/extract-atoms.ts`, `src/core/cycle.ts`)**
+
+- Source-hash existence check before LLM call replaces date-stamped slug as idempotency mechanism. Survives `gbrain sync --force` re-imports.
+- New `discoverExtractablePages(engine, sourceId, affectedSlugs?)` runs ONE raw SQL query with NOT EXISTS subquery: discovers extractable pages (6 types: meeting, source, article, video, book, original) AND filters already-extracted in one round-trip. Replaces the 6-listPages + per-candidate atom-check pattern that would have made ~56 queries per cycle.
+- SQL filters: `source_id`, `type = ANY($::text[])`, `deleted_at IS NULL`, `content_hash IS NOT NULL`, `imported_from <> 'markdown-greenfield'`, `dream_generated <> 'true'`, `length(compiled_truth) >= MIN`, optional `slug = ANY($::text[])` for affectedSlugs, NOT EXISTS atom with matching source_hash.
+- Transcript-side idempotency: `atomsExistForHash(engine, sourceId, contentHash16)` — closes the pre-existing v0.41.2.0 date-stamp duplicate bug for transcripts.
+- `sourceId` threaded through every `engine.putPage(slug, page, {sourceId})` call so atoms land in the correct source on federated brains.
+- New `_pages` test seam mirrors `_transcripts` shape. `_pages: undefined` triggers discovery; `_pages: []` deliberately suppresses.
+- `PhaseResult.details` extended with additive fields: `pages_processed`, `pages_total`, `pages_skipped_budget`, `duplicates_skipped`. All existing fields preserved (regression-tested).
+- `cycle.ts` passes union of `syncPagesAffected + synthesizeWrittenSlugs` as `affectedSlugs` to `runPhaseExtractAtoms`.
+
+**Phase 4: ze-switch pre-apply + pre-resume env-override gate (`src/core/retrieval-upgrade-planner.ts`, `src/commands/ze-switch.ts`, `src/core/retrieval-upgrade-prompt.ts`)**
+
+- New pure exports `detectEnvOverride(targetModel, targetDim, env?)` and `formatEnvOverrideWarning(warning)`. ASCII box (no Unicode per repo D10), line width ≤78 cols, includes paste-ready `unset` command.
+- `ApplyResult` tagged union extended with `{status: 'refused', reason: 'env_override', warning}` variant. `ApplyOpts` interface adds `ignoreEnvOverride?: boolean`.
+- Gate fires FIRST in `applyRetrievalUpgrade` — BEFORE `setConfig(KEY_PREVIOUS_SNAPSHOT)`, BEFORE `runSchemaTransition`. Zero side effects on refusal. Pinned by test that asserts ZERO setConfig calls fire on refused apply.
+- Same gate fires FIRST in `resumeRetrievalUpgrade`. No bypass path.
+- CLI flag `--ignore-env-override` mirrors the existing `--ignore-missing-key` precedent. Loud stderr line when set.
+- Planner stays data-pure — returns the warning struct; CLI handles rendering. Interactive prompt path (`runRetrievalUpgradePrompt`) also handles the new variant gracefully.
+
+**Phase 5: doctor `embedding_env_override` check (`src/commands/doctor.ts`)**
+
+- New `checkEmbeddingEnvOverride(engine)` reads `process.env.GBRAIN_EMBEDDING_MODEL` and `GBRAIN_EMBEDDING_DIMENSIONS`, compares against DB config. Uses `Check.details.mismatches[]` (NOT `Check.issues` which has a different schema).
+- Wired into BOTH `buildChecks()` (local doctor) AND `doctorReportRemote()` (HTTP MCP doctor) per the cross-surface parity convention. Source-grep regression assertion pins both wirings.
+- Message includes paste-ready `unset GBRAIN_EMBEDDING_MODEL GBRAIN_EMBEDDING_DIMENSIONS` fix.
+
+**Test coverage:**
+
+- New `test/extract-batch-retry.test.ts` (16 cases) — withRetry primitive, GBrainError shape recognition, logBatchRetry, snapshot-mutation regression contract.
+- New `test/extract-atoms-page-discovery.test.ts` (17 cases, PGLite) — discovery SQL filters, NOT EXISTS idempotency, dual-source merge, transcript-side idempotency, sourceId threading.
+- New `test/ze-switch-env-override.test.ts` (17 cases, PGLite + withEnv) — pure helpers, applyRetrievalUpgrade integration with engine-setConfig-spy ZERO-mutation assertion, resumeRetrievalUpgrade parity.
+- New `test/doctor-embedding-env-override.test.ts` (7 cases, PGLite + withEnv) — all status branches + cross-surface parity source-grep.
+- New `test/e2e/extract-atoms-discovery-sql.test.ts` (4 cases, real Postgres) — D10 reversal: validates ANY($::text[]) + JSONB ->> + NOT EXISTS + substring through `postgres.unsafe` against real PG.
+- Extended `test/cycle/extract-atoms-synthesize-concepts.test.ts` — `_pages: []` added to all existing cases + 1 critical regression case (legacy PhaseResult.details fields byte-identical to v0.41.2.0 transcript-only path).
+- Extended `test/loadConfig-merge.test.ts` — 8 new dream.* parallel cases (DB merge, file-wins, parent allocation, invalid-int fallback, throw resilience).
+
+**Credit:** rebuilt from work originally proposed by @garrytan-agents in PRs #1414, #1416, #1421. The PR descriptions were the design source — the rebuild's structural improvements came from /plan-eng-review and codex outside-voice. Closes both bug classes (the reported PgBouncer batch loss and the documented 716K-chunk damage incident).
+
+## To take advantage of v0.41.10.1
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the wave's three fixes:**
+   ```bash
+   # dream.* config merge
+   gbrain config set dream.synthesize.session_corpus_dir /tmp/test
+   gbrain config get dream.synthesize.session_corpus_dir
+   # should print /tmp/test, not the file-plane default
+
+   # ze-switch env-override gate
+   GBRAIN_EMBEDDING_MODEL=openai:text-embedding-3-large gbrain ze-switch --non-interactive --force
+   # should refuse with the ASCII warning box, NOT mutate schema
+
+   # doctor surfaces env disagreement
+   GBRAIN_EMBEDDING_MODEL=openai:text-embedding-3-large gbrain doctor --fast | grep embedding_env_override
+   # should show: embedding_env_override: warn
+   ```
+3. **If anything fails or looks wrong,** file an issue at
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+## [0.41.10.0] - 2026-05-25
+
+**Your brain stops being mostly orphan pages.** A new `gbrain extract links --by-mention` pass scans every page's body text for mentions of people and companies you already have pages for, then creates links automatically. The same release also fixes a silent corruption bug in the dream-cycle chunker that could split UTF-16 surrogate pairs (emoji, non-BMP CJK, mathematical alphanumerics) at chunk boundaries, breaking the per-chunk idempotency key on retries.
+
+Most production brains accumulate orphans silently over months because the existing link extractor only sees explicit markdown links. If a meeting note mentions "Acme Corp" or a Slack-import page mentions "Alice Example" in plain text, no link gets created. The `--by-mention` pass closes the gap: build a gazetteer from your existing entity pages, scan every page's body, create one mention link per (source → target) pair.
+
+Five agent-authored PRs (#1378–#1382) surfaced the design and the surrogate-pair fix; this release consolidates the work per design doc #1409.
+
+## To take advantage of v0.41.10.0
 
 `gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
 
@@ -138,6 +261,151 @@ New tests: `test/operations-fuzzy-source-scope.test.ts` (6 PGLite cases: scalar 
 
    This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
 
+   This applies schema migration v95 (widens the `link_source` CHECK to admit `'mentions'`).
+2. **Check your orphan ratio:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name=="orphan_ratio")'
+   ```
+3. **Preview what would get auto-linked:**
+   ```bash
+   gbrain extract links --by-mention --dry-run
+   ```
+4. **Apply the auto-link pass:**
+   ```bash
+   gbrain extract links --by-mention
+   ```
+   ~5 seconds per 1K pages on a representative brain.
+5. **Verify orphan reduction:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name=="orphan_ratio")'
+   gbrain orphans --count
+   ```
+   Both numbers will match (they consume the same canonical `getOrphansData()` pure data fn).
+6. **If any step fails,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and which step broke.
+
+### How to turn it on
+
+```bash
+# One-shot — auto-link every body-text mention of an entity page:
+gbrain extract links --by-mention
+
+# Preview first:
+gbrain extract links --by-mention --dry-run
+
+# Federated-brain users can scope the walk to one source:
+gbrain extract links --by-mention --source-id team-b
+
+# Incremental — only scan recently-modified pages:
+gbrain extract links --by-mention --since 2026-05-01
+
+# JSON output for agent consumption:
+gbrain extract links --by-mention --dry-run --json
+```
+
+### What you'd see in a concrete example
+
+| Scenario | Before | After |
+|---|---|---|
+| `gbrain doctor` on a 165K-page brain with low link coverage | no orphan_ratio surface; brain_score warns about graph health generically | new `orphan_ratio` check fires with explicit count + paste-ready fix-hint |
+| `gbrain extract links --by-mention` against a representative brain | command did not exist | walks DB, builds gazetteer of entity pages, scans bodies, writes mention links |
+| Meeting note saying "Met with Acme Corp and Alice yesterday" | no inbound links to companies/acme or people/alice from this page | both targets gain inbound `link_source='mentions'` rows |
+| Search ranking after `--by-mention` run | (would have shifted globally — mentions counted equally with intent-authored backlinks) | unchanged — mentions filtered out of backlink-count at the SQL layer (D12) |
+| `gbrain doctor` on thin-client install | no visibility into brain-server orphan health | `orphan_ratio` check fires via `find_orphans` MCP op with operator-pointing fix-hint |
+| Dream-cycle chunker on transcript with 🚀 at hard-split boundary | high surrogate orphaned in chunk N, low surrogate orphaned at start of chunk N+1 — invalid UTF-16, content_hash changed across retries | `safeSplitIndex` backs up to a safe boundary; chunks are byte-identical to source; D9 idempotency invariant preserved |
+
+Promise calibration: design doc #1409 originally framed this as "88% orphans → <30%." Codex outside-voice review on the v0.41.10.0 plan flagged that strict-exact title matching + min-name-length ≥4 + no-aliases + no-fuzzy will under-deliver on the real corner cases — 3-char real entities ("YC", "AI"), first-name-only mentions ("Bob"), abbreviations, old company names. Material reduction is the realistic v1 outcome; exact figure TBD via post-merge measurement on a representative brain. TODO-1 (pack-aware gazetteer) + TODO-4 (post-merge measurement) cover the next iterations.
+
+### What to watch for
+
+- **Search ranking is unchanged.** Mention links go into `link_source='mentions'` which is filtered OUT of backlink-count via `IS DISTINCT FROM 'mentions'` in both engines (D12). Existing markdown / frontmatter / manual links still count toward backlink-boost. NULL-source legacy rows still count (the `IS DISTINCT FROM` form is NULL-safe per the `[sql-neq-misses-null-drift]` learning).
+- **Cycle integration is deferred.** v1 is CLI-only; `auto_link_mentions` config gate dropped from v1. Run `--by-mention` manually or via cron. Cycle-phase wiring is TODO-2 (P2 follow-up).
+- **Pack-aware gazetteer is deferred.** Hardcoded entity types for v1: `person`, `company`, `organization`, `entity`. User-defined schema-pack entity types (e.g. `researcher`) won't be auto-linked until TODO-1 (P2 follow-up) lands.
+- **Self-link guard is on.** An entity page mentioning its own title (e.g. body of `companies/acme.md` says "Acme has 500 customers") will NOT auto-create a self-link, avoiding fake orphan-reduction.
+- **Cross-source guard is on.** A page in source A mentioning an entity in source B will NOT auto-link in v1 — deliberate isolation. Can relax in a future wave if real cross-source linking is needed.
+- **Ignore list at gazetteer-build time, not match time.** Built-in ambiguous tokens (Apple, Amazon, Square, Stripe, Box, Meta, Target, Oracle) are dropped from the gazetteer ONLY when no corresponding entity page exists. If you've explicitly created `companies/apple`, the auto-link fires (your intent wins).
+- **FS-source + `--by-mention` rejected.** The gazetteer needs the engine; FS-walk + DB-gazetteer is incoherent. Use `--source db` (or default) for `--by-mention`.
+- **`--by-mention timeline` rejected.** Mentions are a links-pass concern.
+- **Schema migration v95** widens the `link_source` CHECK to admit `'mentions'`. DROP-IF-EXISTS + ADD CONSTRAINT pattern, idempotent on re-application.
+
+### Itemized changes
+
+**Part A — UTF-16 surrogate-pair safety in chunker:**
+
+- New `src/core/text-safe.ts` exports `truncateUtf8` (moved verbatim from `src/core/eval-contradictions/judge.ts:81-106`) + new sibling `safeSplitIndex(text, maxChars): number` (returns the boundary INDEX without allocating a sliced string — what the chunker hot path needs).
+- `src/core/cycle/synthesize.ts` `findBoundary` tier-3 hard-split routes through `safeSplitIndex` so a boundary that lands inside a UTF-16 surrogate pair no longer orphans the high surrogate. The agent-authored fix from PRs #1378–#1382 handled only one of three correctness cases (high+low pair straddle); the case where the cut lands AT a low surrogate (high at maxChars-2) silently bit. `text-safe.ts` covers all three cases.
+- `src/core/eval-contradictions/judge.ts` re-imports `truncateUtf8` from the new shared location with byte-identical behavior; existing 32 judge tests pass unchanged.
+- 21 new test cases pinning the surrogate safety (`test/text-safe.test.ts` + 3 new cases in `test/cycle-synthesize-chunker.test.ts`).
+
+**Part B — Auto-link entity mentions:**
+
+- New `src/core/by-mention.ts` (~240 LOC):
+  - `buildGazetteer(engine, opts)` queries entity-typed pages, applies min-name-length filter (≥4 chars), applies the built-in ignore list at build time (only when no corresponding page exists), returns `Map<lowercase_first_token, GazetteerEntry[]>` sorted longest-first per bucket.
+  - `findMentionedEntities(text, gazetteer, opts)` is a pure function: maximal-munch matcher at each token offset, self-link guard (D13), cross-source guard, per-page first-mention-only cap. Uses existing `stripCodeBlocks()` from `link-extraction.ts` so mentions inside ``` blocks and inline backticks are ignored.
+- `src/core/link-extraction.ts` exports `stripCodeBlocks` (was internal — codex CK8 fix; needed for `by-mention.ts` reuse).
+- New `--by-mention` flag on `gbrain extract links`. Mode dispatch: when set, runs ONLY the mention pass. FS-source + `--by-mention` rejected with paste-ready `--source db` fix-hint. `timeline --by-mention` rejected (mentions are a links-pass concern). Honors `--source-id`, `--since`, `--dry-run`, `--json`.
+- `getOrphansData()` exported as the canonical pure data fn alias for `findOrphans()` in `src/commands/orphans.ts`. The doctor `orphan_ratio` check consumes it; if a future change adds CLI-side post-filtering, the IRON RULE regression test in `test/orphans-pure-fn.test.ts` fires.
+- New `orphan_ratio` doctor check on BOTH local (`runDoctor`) and thin-client (`runRemoteDoctor` via `find_orphans` MCP op) surfaces. Vacuous gate at <100 entity pages, warn >0.5, fail >0.8. Local hint: `Run: gbrain extract links --by-mention`. Thin-client hint: `Ask the brain operator at <url> to run...` (D11).
+- Migration v95 (`links_link_source_check_includes_mentions`) widens the CHECK constraint to admit `'mentions'`. DROP-IF-EXISTS + ADD CONSTRAINT pattern; engine-parity entry in `pglite-schema.ts`.
+- Backlink-count SQL in both engines gains `AND l.link_source IS DISTINCT FROM 'mentions'` on the LEFT JOIN. Mentions filtered from search ranking; still count toward orphan-ratio and graph traversal. NULL-safe per the `[sql-neq-misses-null-drift]` memory (NULL legacy rows still count).
+- 35 new test cases across `test/by-mention.test.ts` (22), `test/extract-by-mention.test.ts` (12), `test/doctor-orphan-ratio.test.ts` (10), `test/backlink-count-mention-filter.test.ts` (6), `test/schema-migrate-link-source-mentions.test.ts` (7), `test/orphans-pure-fn.test.ts` (12), `test/e2e/orphan-reduction.test.ts` (3).
+
+**Follow-ups filed in TODOS.md:**
+
+- TODO-1 P2: Pack-aware `--by-mention` gazetteer (add `linkable: boolean` per-type field to the schema-pack manifest; new accessor `linkableTypesFromPack`).
+- TODO-2 P2: Cycle integration for `--by-mention` (auto_link_mentions config gate; requires runExtractCore DB-source refactor OR a new cycle-only helper).
+- TODO-3 P3: MCP op `extract_links_by_mention` for remote brain-server callers.
+- TODO-4 P1: Post-merge measurement on a representative brain; update #1409 design doc with the measured orphan-ratio delta.
+
+Co-authored credit: `@garrytan-agents` for surfacing both the surrogate-pair fix and the orphan-reduction design across PRs #1378-#1382 (now closed in favor of consolidated design doc #1409).
+## [0.41.9.0] - 2026-05-25
+
+**Five UX/reliability fixes from a single production incident report. Your
+brain stops getting wedged for days when a CLI hangs, your sync stops
+failing 565 files one-at-a-time when an API key is missing, and your error
+messages start telling you what to actually do.**
+
+A gstack user ran `gbrain sync --full` against a 137-file repo and ran
+into five distinct defects in one session. The defects are independent
+but all live in the CLI entrypoint, sync orchestrator, and lock
+infrastructure. They ship as one reliability-hardening wave.
+
+What you can now do:
+
+- **`gbrain sync` checks your embedding credentials up front.** If
+  `OPENAI_API_KEY` is missing, you get one clean error line with a
+  paste-ready fix, not 565 identical failures in your sync-failures.jsonl.
+  Same check on `gbrain embed` and `gbrain import`. Bypass with
+  `--no-embed` if you want to import without embedding.
+- **Failed-sync errors are now bucketed properly.** Embedding failures
+  show up as `EMBEDDING_NO_CREDS`, `EMBEDDING_RATE_LIMIT`,
+  `EMBEDDING_QUOTA`, or `EMBEDDING_OVERSIZE` instead of bucketing into
+  the meaningless `UNKNOWN` pile. `gbrain doctor` summary actually tells
+  you what's wrong.
+- **`gbrain search` and `gbrain sources list` have default timeouts.**
+  30s for search, 10s for sources list. The connect step is bounded too,
+  so a hang in DB connect (PgBouncer freeze, hung TCP) can't spin at
+  100% CPU for days. Override with `--timeout=Ns`.
+- **`gbrain sync` lock-busy error names the holder.** When another sync
+  is already running, the error tells you the holder's PID, hostname,
+  and how long it's been running. If the holder is dead, run
+  `gbrain sync --break-lock` to clear it. If it's wedged but alive,
+  `gbrain sync --force-break-lock` (use carefully).
+- **`gbrain doctor` flags stale locks.** New `stale_locks` check
+  surfaces any lock row whose TTL has expired, with a paste-ready
+  break-lock hint per source.
+- **The "Schema probe/migrate failed: deadlock detected" warning stops
+  firing on every sync.** When two CLIs race on schema probe, the
+  retry-and-poll logic resolves the race silently. The warning only
+  surfaces when migrations are genuinely stuck, and its wording no
+  longer suggests the destructive-sounding `gbrain init --migrate-only`.
+- **`gbrain sync | head -20` exits cleanly.** SIGPIPE handling +
+  process-cleanup registry release locks on abnormal termination so a
+  truncated pipe doesn't wedge the next sync.
+
+To take advantage of v0.41.6.0: just `gbrain upgrade` and re-run your
+flow. No manual migration needed. New `--break-lock` / `--force-break-lock`
+flags are documented in `gbrain sync --help`.
 ## [0.41.8.0] - 2026-05-24
 
 **`gbrain search`, `gbrain query`, and `gbrain get` now actually exit when they finish on PGLite.**

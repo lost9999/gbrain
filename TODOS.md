@@ -1,5 +1,84 @@
 # TODOS
 
+## v0.41.10.1 fix-wave follow-ups (v0.42+)
+
+- [ ] **v0.42+: per-atom idempotency via deterministic atom slug.** The
+  v0.41.10.1 fix wave closed the duplicate-atoms bug class via source-hash
+  existence check at the SOURCE level (skip the whole transcript/page if
+  any atom row exists for `frontmatter.source_hash`). Known limitation
+  surfaced by codex review (D9 #2): if the first Haiku call writes atom
+  1 of 3 then atom 2 throws, the source_hash filter sees atom 1 exists
+  and skips on next discovery — atoms 2 + 3 stay missing until
+  `content_hash` changes. The cleaner solution is per-atom idempotency:
+  switch atom slugs from date-stamped (`atoms/2026-05-25/<title-slug>`)
+  to content-hash-stamped (`atoms/<source_hash16>/<sha8-of-title-body>`)
+  so `engine.putPage` upserts naturally on retry. Bounded scope; needs
+  a migration to consolidate existing duplicate atoms (filed separately
+  below as the v0.42+ consolidation TODO). Priority: P2. References:
+  `src/core/cycle/extract-atoms.ts:atomsExistForHash`, the documented
+  known-limitation comment in the file header.
+
+- [ ] **v0.42+: atom-slug consolidation migration.** The v0.41.10.1 fix
+  wave stops NEW duplicates from being written but doesn't migrate
+  existing duplicate atoms from prior v0.41.2.0 runs. Brains that ran
+  the cycle across multiple days carry duplicate atoms forever (or until
+  manual cleanup): `atoms/2026-05-15/title-X` AND `atoms/2026-05-25/title-X`
+  for the same content_hash. Migration writes a one-shot CLI flow:
+  `gbrain atoms consolidate [--dry-run] [--yes]` that groups atoms by
+  `frontmatter.source_hash`, keeps the oldest atom row, soft-deletes
+  newer copies (uses the existing `softDeletePage` path so 72h restore
+  window applies). Operator opt-in via the same `--confirm-destructive`
+  gate from the destructive-guard. Priority: P3. Filed via /plan-eng-review
+  D6. References: `src/core/cycle/extract-atoms.ts`, the v0.26.5
+  soft-delete + restore infrastructure.
+## v0.41.10.0 follow-ups (orphan-reduction + surrogate fix wave)
+
+- [ ] **TODO-1 (P2) — Pack-aware `--by-mention` gazetteer.** Add `linkable: boolean` per-type field to the schema-pack manifest (`src/core/schema-pack/manifest-v1.ts`, currently has `extractable` + `expert_routing`). New accessor `linkableTypesFromPack(pack: ResolvedPack)` in a new `schema-pack/linkable-types.ts` module mirroring `expert-types.ts`. `src/core/by-mention.ts:buildGazetteer` consults the pack-aware filter first via `loadActivePackBestEffort(ctx)`, falls back to the hardcoded `LINKABLE_ENTITY_TYPES` const for non-pack brains. Respects the D4 fail-empty contract (pack-load failure → empty filter, NOT hardcoded defaults). User-defined types like `researcher` get auto-linked. Requires: pack-schema bump, rubric/registry updates, regression test that pack-aware + non-pack brains produce expected gazetteer shapes.
+
+- [ ] **TODO-2 (P2) — Cycle integration for `--by-mention`.** v0.41.10.0 ships CLI-only. Wire the mention pass into the dream-cycle extract phase so brains running autopilot get incremental auto-link without manual cron. Two paths: (a) refactor `runExtractCore` (currently FS-only at `extract.ts:320`) to support DB-source, then cycle calls it as before; (b) add a dedicated `extractMentionsFromDbForCycle()` callable directly from `runPhaseExtract` at `core/cycle.ts:810` so `runExtractCore` stays focused. Add `auto_link_mentions` config gate (default OFF for safety — opt-in). Also resolve the `sourceScopeOpts(ctx)` issue: cycle context doesn't have an `OperationContext`; need a new helper that produces equivalent scoping for the trusted-workspace cycle write context.
+
+- [ ] **TODO-3 (P3) — MCP op `extract_links_by_mention` for remote brain-server callers.** v0.41.10.0 CLI-only because the API shape was new. Once the CLI is proven (post-ship measurement window), expose as MCP op with `scope: write`, NOT `localOnly` (remote OpenClaw agents should be able to trigger). Trust gate via `op-trust-gate.ts`. Params: optional `source_id`, optional `since`, `dry_run`. Returns `{created, pages}`. Add to `src/core/operations.ts` operation list; wire MCP definitions.
+
+- [ ] **TODO-4 (P1) — Measure actual orphan-ratio reduction on representative brain post-merge.** v0.41.10.0 CHANGELOG softens the design-doc claim from "88% → <30%" to "material reduction, exact figure TBD" per codex CK13 (strict-exact + min-length≥4 + no-aliases + no-fuzzy will under-deliver on 3-char real entities like "YC", first-name mentions like "Bob", and abbreviations). After v0.41.10.0 lands, run `gbrain extract links --by-mention` against the production OpenClaw deployment (~165K pages) and capture before/after orphan_ratio from `gbrain doctor --json`. Update `docs/designs/GBRAIN_ONBOARD.md` (in PR #1409 if still open, or as follow-up edit if merged) with the measured number. Update CHANGELOG retroactively only if the measurement is material to user expectations.
+
+## v0.41.6.0 follow-ups (v0.41.7+)
+
+- [ ] **v0.41.7+: investigate v0.40+ schema-probe deadlock ROOT cause.**
+  v0.41.6.0 D4 ships the symptom fix (retry+poll silently when the race
+  resolves itself; warn with revised wording when truly stuck). Codex
+  outside-voice F12 caught the load-bearing finding: `initSchema()`
+  already takes `pg_advisory_lock(42)` so the SQLSTATE 40P01 race must
+  involve OTHER locks. Hypothesis: DDL locks acquired by initSchema's
+  ALTER / CREATE statements deadlock against application queries
+  (long-running SELECTs on `pages`, PgBouncer pool artifacts). Reproduce
+  on real PgBouncer setup with concurrent reads + simulated migration.
+  Expected outcome: either connection-pool isolation fix or DDL-lock
+  NOWAIT pattern. Effort: human ~4-6h / CC ~1h once repro is in hand.
+  Depends on: nothing; v0.41.6.0 D4 already quiets the alarming warning
+  for the common case, so this investigation is unblocked.
+
+- [ ] **v0.41.7+: wire inline auto-embed errors at sync.ts:1173-1186
+  through `recordSyncFailures`.** v0.41.6.0 D1 closes the headline
+  missing-creds case (preflight short-circuits before any embed call).
+  D2's classifier patterns cover rate-limit / quota / oversize errors
+  for per-file embeds inside `runImport` (which already records
+  failures correctly). But the inline post-import auto-embed catch at
+  `src/commands/sync.ts:1173-1186` swallows errors to stderr only and
+  never reaches `recordSyncFailures`. Wire it through with deduplication
+  guard (some errors may also be recorded by per-file `runImport` —
+  avoid double-recording). Effort: human ~1d / CC ~30min including
+  dedup test surface.
+
+- [ ] **v0.41.7+: true end-to-end cancellation in search via AbortSignal.**
+  v0.41.6.0 D3 `withTimeout` bounds USER wait via Promise.race + process
+  exit. The underlying DB / API socket keeps running until the kernel
+  reaps the process or the server times out the abandoned query. For
+  long-running subagent loops or rerank pipelines, threading AbortSignal
+  end-to-end would save server-side resources. Touches `hybridSearch` +
+  engine + `cosineReScore` + `reranker` signatures. Effort: human ~1d /
+  CC ~3h. Tradeoff: large surface fan-out for marginal benefit on the
+  CLI exit-on-timeout path. Only ship when a non-CLI consumer
+  (HTTP MCP, future autopilot health checks) wants true cancellation.
 ## community-pr-wave follow-ups (filed during ship)
 
 - [ ] **`FREE_LOCAL_*_PROVIDERS` zero-pricing bypassable via redirected
