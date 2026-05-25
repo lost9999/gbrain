@@ -2455,11 +2455,16 @@ export class PGLiteEngine implements BrainEngine {
     // Initialize all slugs to 0 so callers get a consistent map.
     for (const s of slugs) result.set(s, 0);
 
+    // v0.42.0.0 D12: filter mentions OUT of backlink-count for search
+    // ranking — parity with postgres-engine.ts. See that file's comment
+    // for the full rationale. `IS DISTINCT FROM` is NULL-safe so legacy
+    // rows with NULL link_source still count toward backlinks.
     // PGLite needs explicit cast for array binding (does not auto-serialize JS arrays).
     const { rows } = await this.db.query(
       `SELECT p.slug AS slug, COUNT(l.id)::int AS cnt
        FROM pages p
        LEFT JOIN links l ON l.to_page_id = p.id
+         AND l.link_source IS DISTINCT FROM 'mentions'
        WHERE p.slug = ANY($1::text[])
        GROUP BY p.slug`,
       [slugs]

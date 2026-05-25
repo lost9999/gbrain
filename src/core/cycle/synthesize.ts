@@ -42,6 +42,7 @@ import { discoverTranscripts, type DiscoveredTranscript } from './transcript-dis
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
 import { validateSourceId } from '../utils.ts';
+import { safeSplitIndex } from '../text-safe.ts';
 
 // Slug regex from validatePageSlug — kept in sync.
 // Used for the orchestrator-written summary index slug.
@@ -183,7 +184,12 @@ function findBoundary(text: string, maxChars: number, searchStart: number): numb
   const nlIdx = window.lastIndexOf('\n');
   if (nlIdx >= 0) return searchStart + nlIdx;
   // No boundary fits; hard-split at maxChars (deterministic).
-  return maxChars;
+  // v0.42.0.0: route through safeSplitIndex so a hard-split that lands
+  // between a UTF-16 surrogate pair (emoji / non-BMP CJK / mathematical
+  // alphanumerics) doesn't orphan the high surrogate — that would change
+  // chunk byte-content vs the source and break the D9 stable-chunk-identity
+  // invariant on the next retry.
+  return safeSplitIndex(text, maxChars);
 }
 
 /**
