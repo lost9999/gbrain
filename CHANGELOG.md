@@ -2,6 +2,94 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.8.0] - 2026-05-24
+
+**`gbrain search`, `gbrain query`, and `gbrain get` now actually exit when they finish on PGLite.**
+
+Until today, if you ran `gbrain search "fox"` on a PGLite brain, the results printed in under a second... and then the process sat there at ~95-98% CPU forever. You had to kill it with Ctrl-C. Scripted callers (`gbrain search "x" && echo ok`) never reached the `&& echo ok`. Cron jobs timed out. This was the #1 community pain reported since v0.37, with five open issues — three for the search-hang shape ([#1247](https://github.com/garrytan/gbrain/issues/1247), [#1269](https://github.com/garrytan/gbrain/issues/1269), [#1290](https://github.com/garrytan/gbrain/issues/1290)) plus a related WASM-init failure ([#1340](https://github.com/garrytan/gbrain/issues/1340)) and a single-reporter sync hang ([#1342](https://github.com/garrytan/gbrain/issues/1342)).
+
+The fix turns out to be one structural change in two parts. v0.37 added a stale-page-detection feature that fires a background `UPDATE pages SET last_retrieved_at = NOW()` after every search/query/get. The CLI's job is to print the results, close the database, and exit — but on PGLite the database is a WASM runtime that holds Bun's event loop alive while the background UPDATE is still in flight. Closing the database mid-write strands the write on a dead handle, and Bun never notices the process is supposed to exit. So now the CLI explicitly waits for the background write to finish before closing the database. On the rare pathological case where the wait itself takes more than 5 seconds (a future bug we haven't seen yet but want to defend against), we log a stderr warning naming the leak and force-exit cleanly. Daemons (`gbrain serve`, `gbrain serve --http`) are explicitly excluded from the force-exit so they stay running.
+
+For #1340 (PGLite WASM init failing on older macOS + Bun 1.3.x), the error message now correctly identifies the root cause as Bun's vfs read-only mount rather than the unrelated macOS 26.3 WASM bug:
+
+```text
+PGLite failed to initialize its WASM runtime.
+  This looks like a Bun vfs issue: `/$$bunfs/root` is read-only on
+  your system, so PGLite cannot extract its pglite.data WASM payload.
+  Fix: `bun upgrade` (newer Bun mounts the vfs writable). If that
+  does not help, run via Node: `node src/cli.ts` or install gbrain
+  using the Node-based path. See #1340 for details.
+```
+
+### The numbers that matter
+
+| Scenario | Before v0.41.8.0 | After v0.41.8.0 |
+|---|---|---|
+| `gbrain search "x"` on PGLite, exit time | Never (hangs at ~95-98% CPU until SIGKILL) | <2s |
+| `gbrain query "x" --no-expand` on PGLite | Never exits | <2s |
+| `gbrain get <slug>` on PGLite | Never exits | <1s |
+| Scripted `gbrain search ... && echo OK` | `OK` never printed | `OK` printed |
+| `gbrain init --pglite` on macOS 12.7 + Bun 1.3.14 | Failed with misleading macOS 26.3 hint | Failed with correct bunfs/`bun upgrade` hint |
+| `gbrain sync` hang ([#1342](https://github.com/garrytan/gbrain/issues/1342)) | No diagnostic output before hang | Phase breadcrumbs name WHICH phase spun |
+| `gbrain serve --http` (daemon) | Stayed alive | Still stays alive (regression-tested) |
+
+### Why we narrowed the force-exit
+
+Two community PRs proposed competing fixes. [PR #1259](https://github.com/garrytan/gbrain/pull/1259) (jehoon, validated by @eloe, @bcallender, and @61tH0b) added the structural "wait for the background write to finish" pattern — the right approach, mirroring an existing fix we shipped for #1090. [PR #1337](https://github.com/garrytan/gbrain/pull/1337) (matt-dean-git) took a different approach: force-exit the process after `main()` returns for every non-daemon command. PR #1337 also reordered the disconnect to release the file lock before closing the database, and added a snapshot+early-null pattern to the disconnect itself.
+
+We took the drain from #1259, took the snapshot+early-null pattern from #1337, and narrowed PR #1337's force-exit to fire ONLY when the drain timed out — not unconditionally for every command. Reason: an unconditional force-exit would mask every future fire-and-forget regression. The narrow version preserves the diagnostic stderr warn that names the leaking surface, AND guarantees the CLI exits even on the pathological path. Reviewed via [/plan-eng-review](https://github.com/garrytan/gstack) (9 decisions) + Codex outside-voice (13 findings, all folded in). We also kept the original close-then-release disconnect order; PR #1337's swap to release-then-close would have widened the window where a sibling process could connect to a still-closing brain.
+
+### Things to watch
+
+- The `[gbrain phase] sync.<name>` breadcrumbs now print to stderr at four new boundaries (`sync.resolve_repo`, `sync.load_active_pack`, `sync.validate_repo_state`, `sync.detect_head`). If you parse gbrain stderr in a script, the new lines mirror the existing `[gbrain phase] sync.git_pull start/done` pattern from v0.28.1.
+- If you ever see `[last-retrieved] drain timed out after 5000ms; N writes still pending` on stderr, that's a defense-in-depth signal — it means a tracked background write took longer than 5 seconds. It's safe to ignore (the CLI still exits cleanly), but please file an issue with the pending count and the command you ran. This is how we'd find the next bug class in this surface.
+- #1342 (`gbrain sync` hang after schema v89→v92) is NOT fixed in this release. It's a single-reporter bug with a pure-JS infinite-loop shape (per `sample <pid>`) that doesn't match any of the hypotheses we ruled out. We've filed it as a follow-up investigation in [TODOS.md](TODOS.md) with concrete diagnostic next steps. If you hit it, please attach a `bun --inspect-brk` stack — the new breadcrumbs will name which phase to look at.
+
+## To take advantage of v0.41.8.0
+
+`gbrain upgrade` should do this automatically. If you were hitting #1247/#1269/#1290 before, no manual action is required — the fix is in the binary.
+
+1. **Run upgrade:**
+   ```bash
+   gbrain upgrade
+   ```
+2. **Verify the CLI exits cleanly:**
+   ```bash
+   time gbrain search "test" --limit 3
+   echo "EXIT=$?"
+   ```
+   `EXIT=0` and a wall time under 2 seconds (after the first cold-start) means the fix landed. Pre-fix you would see no exit at all.
+3. **If you hit #1340 on older macOS + Bun:** run `bun upgrade` and retry. If that doesn't help, install gbrain via Node instead of via the Bun-compiled binary.
+4. **If any step fails or you see new hangs**, please file an issue:
+   https://github.com/garrytan/gbrain/issues with the command you ran, your platform (macOS / Linux + Bun version), and whether you see the `[last-retrieved] drain timed out` stderr line.
+
+### Itemized changes
+
+#### Search/query/get hang fix (#1247, #1269, #1290)
+
+- `src/core/last-retrieved.ts` — new `awaitPendingLastRetrievedWrites(timeoutMs?)` drain helper with bounded 5s `Promise.race` timeout. Tracks every `bumpLastRetrievedAt` IIFE promise in a module-scoped `Set<Promise<unknown>>`; resolves once all settle. Returns `{outcome, pending}` so the caller can decide its fallback. Mirrors the existing v0.36.1.x `awaitPendingSearchCacheWrites` precedent from #1090, plus the timeout the original helper lacks (a symmetry retrofit is filed as a v0.41+ TODO).
+- `src/cli.ts` — awaits `awaitPendingLastRetrievedWrites()` unconditionally in the op-dispatch finally block, right after the existing search-cache drain. On `outcome === 'timeout'` AND `shouldForceExitAfterMain(argv)` (excludes `serve`), calls `process.exit(0)` AFTER `engine.disconnect()` completes. Per-op-name gating was deliberately NOT applied — PR #1259's original literal-name check would have left `search` and `get_page` exposed.
+- `src/core/pglite-engine.ts:disconnect` — snapshot+early-null pattern (snapshot `_db`/`_lock` refs and null instance fields up front so concurrent `connect()` cannot observe a partial mid-close state) wrapped in try/finally so the file lock releases even if `db.close()` throws. KEEPS the original close-then-release order; PR #1337's release-then-close swap was rejected (widens the window where a sibling process could connect to a still-closing brain).
+
+#### #1340 WASM init hint routing
+
+- `src/core/pglite-engine.ts` — new exported `classifyPgliteInitError(message): 'bunfs' | 'macos-26-3' | 'unknown'` + `buildPgliteInitErrorMessage(verdict, original)`. The `bunfs` verdict matches the literal `$$bunfs` marker OR `ENOENT[\s\S]*pglite\.data` co-occurrence; surfaces a paste-ready `bun upgrade` hint + Node fallback. `macos-26-3` keeps the existing #223 link. Regex tightened per Codex eng-review finding #9 so generic `pglite.data` mentions don't false-trip the bunfs verdict.
+
+#### #1342 diagnostic breadcrumbs
+
+- `src/commands/sync.ts:performSyncInner` — four new stderr breadcrumbs at major phase boundaries: `sync.resolve_repo`, `sync.load_active_pack`, `sync.validate_repo_state` (when sourceId is set), `sync.detect_head`. Mirrors the pre-existing `sync.git_pull start/done` pattern. Doesn't fix #1342 but converts "hung with no output" into actionable diagnostic data.
+
+#### Test coverage
+
+- `test/last-retrieved.test.ts` (NEW) — 6 unit cases covering empty drain, single/multi-pending settle, throw-in-IIFE still settles, permanently-pending hits timeout within bound, empty pageIds not tracked.
+- `test/pglite-engine-disconnect.serial.test.ts` (NEW) — 5 lifecycle invariants: close-before-release ordering, snapshot observable inside close, lock-still-releases on close-throw, double-disconnect idempotency, reconnect-after-disconnect clean state.
+- `test/pglite-init-classifier.test.ts` (NEW) — 12 pure-function unit cases including the #1340 reporter's exact error string round-trip + a negative case asserting generic `pglite.data` mentions don't trip the bunfs verdict.
+- `test/e2e/pglite-cli-exit.serial.test.ts` (NEW IRON-RULE regression) — real `bun src/cli.ts` subprocess against a hermetic PGLite tempdir; asserts `search`, `query --no-expand`, `get` all exit 0 within 15s; daemon-survival case asserts `gbrain serve --http` stays alive past 3s (regression guard for the narrow force-exit not misclassifying 'serve' as a non-daemon).
+- `test/fix-wave-structural.test.ts` (EXTENDED) — behavioral-positioning assertion that the drain `await` appears textually BEFORE `engine.disconnect()` in cli.ts (survives variable-rename refactors), plus structural pins for the classifier exports and the sync breadcrumbs. Per D8 in the eng review (Codex finding #5), explicitly did NOT add a drift-guard counting `bumpLastRetrievedAt(` callers.
+
+### Credit
+
+PR [#1259](https://github.com/garrytan/gbrain/pull/1259) by jehoon supplied the structural drain pattern. PR [#1337](https://github.com/garrytan/gbrain/pull/1337) by matt-dean-git supplied the snapshot+early-null disconnect pattern and the force-exit idea we narrowed to fire only on the drain-timeout path. @eloe, @bcallender, and @61tH0b independently validated PR #1259's fix against real reproducers. Closing PRs land with `Co-Authored-By:` trailers on the merge commit.
 ## [0.41.7.0] - 2026-05-24
 
 **Your compact OpenClaw resolver actually works now.** If you've grown your agent past 200 skills and switched to the compact list-format resolver (`- **gift-advisor**: gift idea | birthday gift`) because the markdown-table version got unreadable, `gbrain doctor` used to silently report every single skill as unreachable. On a 306-skill agent, that was 238 FAIL errors on every doctor run, and the list-format resolver was effectively invisible to gbrain. v0.41.7.0 fixes that — the parser now reads both shapes natively, mixes them in one file, and `gbrain doctor` reports 0 errors on the same resolver that previously broke it.

@@ -538,6 +538,13 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
 }
 
 async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  // v0.41.8.0 (D9 / #1342): phase breadcrumbs. The #1342 reporter saw
+  // ZERO stderr output before their sync hang, which made the bug
+  // impossible to triage. Mirror the existing `[gbrain phase] sync.git_pull`
+  // pattern at the major phase boundaries so the next #1342-shaped
+  // report names WHICH phase spun. Doesn't fix #1342 but converts
+  // "hung with no output" into actionable diagnostic data.
+  serr(`[gbrain phase] sync.resolve_repo`);
   // Resolve repo path
   const repoPath = opts.repoPath || await readSyncAnchor(engine, opts.sourceId, 'repo_path');
   if (!repoPath) {
@@ -547,6 +554,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     throw new Error(hint);
   }
 
+  serr(`[gbrain phase] sync.load_active_pack`);
   // v0.39 T1.5: load active pack ONCE at sync entry; pass to every per-file
   // importFile call below. Codex perf finding #7: per-file loadActivePack adds
   // disk/YAML/hash overhead × thousands of files. Best-effort: pack load
@@ -571,6 +579,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // we recover from missing/no-git/not-a-dir by re-cloning, refuse on
   // url-drift or corruption with structured hints.
   if (opts.sourceId) {
+    serr(`[gbrain phase] sync.validate_repo_state`);
     const { validateRepoState } = await import('../core/git-remote.ts');
     const { recloneIfMissing } = await import('../core/sources-ops.ts');
     const cfgRows = await engine.executeRaw<{ config: unknown }>(
@@ -618,6 +627,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     throw new Error(`Not a git repository: ${repoPath}. GBrain sync requires a git-initialized repo.`);
   }
 
+  serr(`[gbrain phase] sync.detect_head`);
   // Detect detached HEAD up front so the working-tree fallback fires for both
   // the default sync and `--no-pull` callers. Only the actual git pull is
   // gated on opts.noPull.
