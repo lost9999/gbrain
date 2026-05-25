@@ -134,8 +134,9 @@ describe('awaitPendingLastRetrievedWrites', () => {
     // Should return within timeout + small buffer; not block forever
     expect(dt).toBeGreaterThanOrEqual(100);
     expect(dt).toBeLessThan(300);
-    // The pending promise stays in the set (we don't cancel; we just
-    // walk away). Next test's beforeEach clears it.
+    // C1 fix: snapshot's tracked promises ARE dropped from the set on
+    // timeout so the next drain doesn't see ghosts (daemon leak guard).
+    expect(_peekPendingLastRetrievedWritesForTests()).toBe(0);
   });
 
   test('bumpLastRetrievedAt with empty pageIds does not track a promise', async () => {
@@ -144,5 +145,32 @@ describe('awaitPendingLastRetrievedWrites', () => {
     expect(_peekPendingLastRetrievedWritesForTests()).toBe(0);
     const result = await awaitPendingLastRetrievedWrites();
     expect(result).toEqual({ outcome: 'drained', pending: 0 });
+  });
+
+  test('C1 fix: second drain after timeout is clean (daemon leak guard)', async () => {
+    // Adversarial-review C1: in `gbrain serve` (long-lived), a timed-out
+    // IIFE used to stay tracked forever because its `.finally` never
+    // fires. Repeated timeouts would leak references without bound.
+    // After the timeout, the next drain MUST see an empty set and
+    // return immediately rather than re-timing-out on the same ghost.
+    const neverEngine = makeStubEngine({
+      executeRaw: () => new Promise<unknown[]>(() => {
+        /* never */
+      }),
+    });
+    bumpLastRetrievedAt(neverEngine, [1]);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(_peekPendingLastRetrievedWritesForTests()).toBe(1);
+
+    const first = await awaitPendingLastRetrievedWrites(100);
+    expect(first.outcome).toBe('timeout');
+    expect(_peekPendingLastRetrievedWritesForTests()).toBe(0);
+
+    // Second drain with no new writes returns immediately.
+    const t0 = Date.now();
+    const second = await awaitPendingLastRetrievedWrites(100);
+    const dt = Date.now() - t0;
+    expect(second).toEqual({ outcome: 'drained', pending: 0 });
+    expect(dt).toBeLessThan(50);
   });
 });

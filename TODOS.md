@@ -367,6 +367,22 @@ Three items deferred:
   spun (resolve_repo / load_active_pack / validate_repo_state /
   detect_head). Doesn't fix; makes reports actionable.
 
+- [ ] **Concurrent disconnect-during-connect race on `PGLiteEngine`
+  (adversarial-review C6, v0.41.8.0).** The v0.41.8.0 snapshot+early-null
+  pattern in `disconnect()` improves the partial-state race for the
+  common case (single instance, sequential lifecycle), but a concurrent
+  `connect()` and `disconnect()` on the same engine instance can still
+  strand: `disconnect()` snapshots+nulls the lock and releases it while
+  `connect()` is still in-flight (lock already acquired, awaiting
+  `PGlite.create()`). When `connect()` resolves, `this._db` is assigned
+  to a fresh handle but `this._lock` is null — engine is "connected"
+  but holds no file lock; another process can acquire it concurrently.
+  Unusual caller pattern in production (one instance per process,
+  sequential lifecycle), but tests sometimes do this and the contract
+  is undefined. Fix: serialize connect/disconnect with an instance-level
+  mutex, or document the constraint and assert single-flight at the
+  call site.
+
 - [ ] **Retrofit `awaitPendingSearchCacheWrites` with the same bounded
   timeout v0.41.8.0 added to `awaitPendingLastRetrievedWrites`.** The
   v0.36.1.x #1090 fix at `src/core/search/hybrid.ts:36-45` shipped the

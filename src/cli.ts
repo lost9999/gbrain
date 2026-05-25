@@ -10,7 +10,7 @@ import type { AIGatewayConfig } from './core/ai/types.ts';
 import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
-import { awaitPendingLastRetrievedWrites } from './core/last-retrieved.ts';
+import { awaitPendingLastRetrievedWrites, type DrainOutcome } from './core/last-retrieved.ts';
 import { shouldForceExitAfterMain } from './core/cli-force-exit.ts';
 import { serializeMarkdown } from './core/markdown.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
@@ -189,10 +189,28 @@ async function main() {
   // Drain the fire-and-forget set BEFORE disconnect; force-exit only
   // if the drain itself times out (preserves stderr diagnostic signal
   // AND guarantees the CLI doesn't re-hang at the disconnect layer).
-  let drainResult: { outcome: 'drained' | 'timeout'; pending: number } = {
-    outcome: 'drained',
-    pending: 0,
-  };
+  //
+  // Defense-in-depth (adversarial-review C13): `engine.disconnect()` itself
+  // can hang on PGLite (db.close() or releaseLock racing OS-level FS state).
+  // Install an unref'd setTimeout hard-exit fallback BEFORE entering the
+  // try/catch/finally so a hung disconnect cannot defeat the force-exit
+  // contract. Daemons (`serve`) are excluded so they stay alive.
+  const DISCONNECT_HARD_DEADLINE_MS = 10_000;
+  let forceExitTimer: ReturnType<typeof setTimeout> | undefined;
+  if (shouldForceExitAfterMain()) {
+    forceExitTimer = setTimeout(() => {
+      console.warn(
+        `[cli] engine.disconnect() did not return within ${DISCONNECT_HARD_DEADLINE_MS}ms — force-exiting`,
+      );
+      process.exit(0);
+    }, DISCONNECT_HARD_DEADLINE_MS);
+    // unref so the timer itself doesn't keep the event loop alive — only
+    // the actual pending work (PGLite WASM handle) does. Without unref,
+    // we'd block a clean exit by 10s on every successful CLI run.
+    forceExitTimer.unref?.();
+  }
+
+  let drainResult: DrainOutcome = { outcome: 'drained', pending: 0 };
   try {
     const ctx = await makeContext(engine, params);
     const rawResult = await op.handler(ctx, params);
@@ -212,6 +230,11 @@ async function main() {
     // PR #1259 mistake that left search and get_page exposed.
     drainResult = await awaitPendingLastRetrievedWrites();
   } catch (e: unknown) {
+    // C9 fix: drain BEFORE process.exit so a successful op that throws
+    // during stdout/format still gets its bumpLastRetrievedAt UPDATE
+    // a chance to commit. Bounded by the drain's own 5s timeout; the
+    // outer hard-exit timer above bounds the disconnect path.
+    try { await awaitPendingLastRetrievedWrites(); } catch { /* best-effort */ }
     if (e instanceof OperationError) {
       console.error(`Error [${e.code}]: ${e.message}`);
       if (e.suggestion) console.error(`  Fix: ${e.suggestion}`);
@@ -221,6 +244,7 @@ async function main() {
     process.exit(1);
   } finally {
     await engine.disconnect();
+    if (forceExitTimer) clearTimeout(forceExitTimer);
     // Narrow force-exit: only when the drain timed out AND we are NOT
     // running a daemon. The drain helper already stderr-warned with the
     // pending count, so the diagnostic signal is preserved. Without

@@ -110,7 +110,8 @@ describe('v0.36.1.x #1124 — query --no-expand actually negates expand', () => 
 describe('v0.41.8.0 #1247/#1269/#1290 — drain last-retrieved before CLI disconnect', () => {
   test('cli.ts imports awaitPendingLastRetrievedWrites', () => {
     const src = readFileSync('src/cli.ts', 'utf8');
-    expect(src).toMatch(/import\s+\{\s*awaitPendingLastRetrievedWrites\s*\}\s*from\s+['"]\.\/core\/last-retrieved\.ts['"]/);
+    // Allow additional type-imports from the same module (e.g. `type DrainOutcome`)
+    expect(src).toMatch(/import\s+\{[^}]*\bawaitPendingLastRetrievedWrites\b[^}]*\}\s*from\s+['"]\.\/core\/last-retrieved\.ts['"]/);
   });
 
   test('last-retrieved.ts exports the drain + tracks promises in a module-scoped Set', () => {
