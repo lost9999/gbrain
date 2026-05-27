@@ -2,6 +2,160 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.26.1] - 2026-05-27
+
+**Your worker daemon stops crashing 39 times a day.**
+
+If you run `gbrain` against Supabase (or any Postgres behind PgBouncer),
+the background worker that handles your sync, embed, and brainstorm
+jobs has been quietly dying every 30 minutes or so. The supervisor
+restarts it cleanly, jobs eventually complete, and nothing looks broken
+in `gbrain jobs list`. But under the hood, every time PgBouncer rotated
+its connection pool, the worker hit an unhandled Promise rejection and
+exited with code 1. Production saw ~39 crashes per day per worker.
+v0.41.26.1 makes the worker survive those blips without skipping a
+beat — the renewal call retries quietly, the audit log records what
+happened, and your jobs keep running.
+
+The bigger fix underneath: every place in the worker that talked to
+the database during a connection blip could have crashed the same way.
+The lock-renewal timer was the headline (1 of 2 vectors), but the
+finally-and-catch path around every job was the second one. Both are
+closed now.
+
+This release also adds a tiny but load-bearing privacy fix: when audit
+log entries record a database error message, they used to leak the
+connection string (host, port, password) directly into the JSONL file.
+If you ever pasted an audit dump into a GitHub issue or Slack to debug
+something, you were leaking credentials. Now those values are
+auto-redacted before they hit disk. Both the new `lock-renewal` audit
+and the existing `batch-retry` audit get this protection.
+
+## How to verify after upgrade
+
+`gbrain upgrade` handles everything. No manual steps. To confirm the
+fix is live:
+
+```bash
+# 1. Check that the worker shape guard is wired into your verify gate.
+bun run check:worker-lock-renewal-shape  # should print "lock-renewal shape OK"
+
+# 2. Watch the audit channel during a real Supabase reconnect.
+tail -F ~/.gbrain/audit/lock-renewal-*.jsonl
+
+# 3. Force a connection blip (only if you can):
+docker exec your-pgbouncer-container pkill -HUP pgbouncer
+# Expected: 1-2 `failure` events, then a `success_after_failure` event
+# when the connection comes back. Worker process MUST NOT exit. If it
+# does, please file an issue with `gbrain doctor` output.
+```
+
+If you previously saw your supervisor restarting workers every 5-30
+minutes with `code=1 (runtime_error)` exits, those should stop.
+
+If you want to tune the failure-recovery window:
+
+```bash
+# Defaults are sensible. These are operator-tunable env knobs.
+export GBRAIN_LOCK_RENEWAL_CALL_TIMEOUT_MS=10000  # per-call timeout
+export GBRAIN_LOCK_RENEWAL_SAFETY_MARGIN_MS=5000  # release-before-stall headroom
+```
+
+### Itemized changes
+
+#### Fixed: worker crashes from unhandled Promise rejections
+
+- **The lock-renewal timer no longer crashes the daemon on PgBouncer
+  blips.** Pre-fix: `setInterval(async () => await renewLock(...))`
+  let any throw escape to `process.on('unhandledRejection')` and exit
+  the worker with code 1. Now: synchronous timer wrapper around a
+  pure `runLockRenewalTick` function with try/catch coverage on every
+  await path. Adds re-entrancy guard so overlapping ticks during a
+  pool stall don't pile concurrent connection acquisitions on an
+  already-saturated PgBouncer.
+- **Second crash vector closed: the stored `executeJob.finally()`
+  promise now has an explicit `.catch()` handler.** During the same DB
+  outage, `failJob` or `completeJob` could throw inside the catch
+  block; that rejection used to escape too. Now logged to stderr +
+  recorded in the audit JSONL as `executeJob_rejected`.
+- **Per-call timeout via `Promise.race`** so a hung renewLock can't
+  wedge the re-entrancy guard indefinitely. Default 10s (1/3 of the
+  default 30s lock duration).
+- **Time-based abort, not count-based.** Pre-fix design (the
+  contributor's first cut) aborted after N consecutive failures,
+  which with the default 30s lock could let another worker reclaim
+  the row BEFORE this worker noticed. Time-based abort fires when
+  `now - lastSuccessfulRenewalAt >= lockDuration - safetyMargin`
+  (default 25s with 5s headroom), so we release the lock voluntarily
+  before the stall detector can race us.
+- **Infrastructure aborts don't burn job attempts.** When the worker
+  releases a job because of a PgBouncer outage (not because the job
+  itself failed), `executeJob` now skips `failJob` and lets the stall
+  detector requeue cleanly. Pre-fix this would dead-letter healthy
+  jobs after 3 PgBouncer blips. The exported
+  `INFRASTRUCTURE_ABORT_REASONS` set is the single source of truth.
+- **Universal grace-eviction.** The 30s force-evict safety net used
+  to fire only for explicit `job.timeout_ms` aborts. Now fires for
+  ANY abort reason — handlers that ignore AbortSignal can't wedge an
+  `inFlight` slot forever on lock-renewal aborts either.
+
+#### Added: lock-renewal audit JSONL at `~/.gbrain/audit/lock-renewal-*.jsonl`
+
+- Four outcome variants: `failure` (one renewLock throw),
+  `success_after_failure` (recovery), `gave_up` (time-based abort
+  fired), `executeJob_rejected` (second-vector forensic trail).
+- Mirrors the existing `batch-retry-audit` pattern: ISO-week rotation,
+  honors `GBRAIN_AUDIT_DIR`, dual-week read-back, corrupted-line
+  tolerance, `pruneOldLockRenewalAuditFiles(30)` for the future
+  dream-cycle purge wiring.
+- Never logs `lock_token` or `job.data`. Only failure/recovery events
+  fire — successful renewals stay silent, which is ~5760 events/day
+  per active job saved.
+
+#### Added: shared connection-info redactor (privacy backfill)
+
+- New `src/core/audit/redact-connection-info.ts` strips `postgres://`
+  URLs, `host=`, `user=`, `password=`, IPv4 octets from any text
+  before it lands in a JSONL audit. Negative-lookbehind defeats
+  version-string false positives (`v3.1.4.0`, `tree-sitter@0.26.3.1`).
+- Wired into BOTH the new `lock-renewal-audit` AND the existing
+  `batch-retry-audit`. The batch-retry module had the same risk class
+  — pre-fix, an exhausted-retry event could leak the connection
+  string of a failing batch write. Now both surfaces are
+  share-safe.
+
+#### Added: env-overridable knobs
+
+- `GBRAIN_LOCK_RENEWAL_MAX_FAILURES` (default 3, audit-labeling only)
+- `GBRAIN_LOCK_RENEWAL_CALL_TIMEOUT_MS` (default `lockDuration / 3`)
+- `GBRAIN_LOCK_RENEWAL_SAFETY_MARGIN_MS` (default `lockDuration / 6`)
+- Bad values fall back to defaults with a single per-process stderr
+  warning (no silent ignore).
+
+#### Added: CI shape guard `check:worker-lock-renewal-shape`
+
+- Wired into `bun run verify`. Asserts (a) the v0.41.22.1 bug pattern
+  (`lockTimer = setInterval(async ...)`) stays absent from
+  `src/core/minions/worker.ts`, (b) `launchJob` calls the extracted
+  pure `runLockRenewalTick` function so the test seam survives
+  refactors. Bug-pattern-specific so it doesn't fight legitimate
+  unrelated changes elsewhere in the file.
+
+#### Tests
+
+- 46 new test cases across 5 new test files: pure-function state
+  machine (18), audit primitive contract (11), redactor patterns
+  (15), batch-retry privacy backfill regression (3), CI guard
+  meta-tests (5). All hermetic — no PGLite, no real network, no
+  `mock.module`.
+- 169 existing minion tests still pass.
+
+#### Contributor credit
+
+This wave supersedes PR #1567 from `@garrytan-agents` and incorporates
+its core try/catch shape. Outside-voice review (codex) caught 8
+additional gaps the inside-review missed, all absorbed.
+
 ## [0.41.26.0] - 2026-05-27
 
 **`gbrain dream --source <id>` finally counts as a cycle.**

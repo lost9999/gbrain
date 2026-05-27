@@ -1,5 +1,75 @@
 # TODOS
 
+## v0.41.26.1 lock-renewal cathedral follow-ups (v0.42+)
+
+- **TODO-LR-1 (P2): PR #1567 surrogate-pair fix for synthesize.ts.**
+  PR #1567 bundled a `safeSliceEnd` UTF-16 surrogate-pair handler
+  alongside the lock-renewal try/catch. The lock-renewal change shipped
+  in v0.41.26.1; the surrogate fix was deferred because it's a
+  different bug class with its own test surface.
+  - **What:** lift `safeSliceEnd` into a shared
+    `src/core/string-safe-slice.ts`, apply to `judgeSignificance` AND
+    `findBoundary` in `src/core/cycle/synthesize.ts`, add round-trip
+    tests with surrogate-bearing transcripts. Pre-existing TODO at
+    TODOS.md (search `Multibyte sanitizer test`) covers part of this
+    — extend that entry.
+  - **Why:** transcripts containing emoji + 4-byte CJK chars get
+    cut mid-pair under the current `.slice(0, N)`, breaking JSON
+    parse downstream and dropping rows.
+  - **Source:** community PR #1567, contributor `@garrytan-agents`.
+
+- **TODO-LR-2 (P2): doctor check `lock_renewal_health`.**
+  v0.41.26.1 ships the audit JSONL primitive without a doctor read
+  surface. For now, `tail -F ~/.gbrain/audit/lock-renewal-*.jsonl` is
+  the operator UX.
+  - **What:** add `checkLockRenewalHealth` in `src/commands/doctor.ts`
+    mirroring `checkBatchRetryHealth` shape. Reads
+    `readRecentLockRenewalEvents(24)`. Warns at >=5 `gave_up` events
+    or >=20 `failure` events in the last 24h. Wired into both
+    `runDoctor` (local) and `doctorReportRemote` (thin-client).
+  - **Why:** operators on production Supabase want a single `gbrain
+    doctor` line to know whether their pool is flapping.
+  - **Pros:** structurally matches the v0.41.18 batch-retry health
+    check. ~50 LOC.
+
+- **TODO-LR-3 (P3): wire `pruneOldLockRenewalAuditFiles(30)` into
+  `gbrain dream --phase purge`.**
+  - **What:** one-line addition at the existing purge handler where
+    `pruneOldBatchRetryAuditFiles` is called today.
+  - **Why:** consistency with the batch-retry audit (which prunes).
+    Without pruning, lock-renewal audit files accumulate one per
+    ISO-week — negligible at first but worth doing the right way.
+
+- **TODO-LR-4 (P2, codex C13): stall-detector re-entrancy guard at
+  worker.ts:269.**
+  The stall-detector `setInterval(async ...)` block has try/catch on
+  every await so it doesn't crash. But it lacks a re-entrancy guard,
+  so during a PgBouncer outage, 3 concurrent stall-detector loops can
+  pile 9 pending connection acquisitions per tick on an
+  already-saturated pool — amplifying the very stall they're trying
+  to detect.
+  - **What:** apply the same `tickInFlight` boolean guard pattern
+    the lock-renewal fix uses. Convert `setInterval(async () => {...})`
+    → `setInterval(() => { if (tickInFlight) return; tickInFlight =
+    true; void (async () => {...})().finally(() => { tickInFlight =
+    false; }); })`.
+  - **Why:** same bug class as the v0.41.22.1 lock-renewal crash, but
+    a different symptom. Doesn't crash, does amplify load.
+  - **Source:** codex outside-voice review of v0.41.26.1 plan.
+
+- **TODO-LR-5 (P3): bare-quoted hostname + username redactor patterns.**
+  The v0.41.26.1 `redactConnectionInfo` catches bare `host=`,
+  `user=`, `password=`, `pg_url`, `ipv4` patterns but NOT
+  bare-quoted hostnames (`connection to server at "db.example.com"`)
+  or bare-quoted usernames (`for user "postgres.abcdef123456"`). The
+  IP in those PG error shapes is the highest-value leak (publicly
+  resolvable), and that one IS caught.
+  - **What:** extend the pattern set with optional quoted-string
+    matchers, OR add a context-aware matcher that looks for `at
+    "...".? (?:port|.)` shapes.
+  - **Cons:** quoted-string false positives are common (DB names,
+    role names); needs careful pattern design.
+
 ## v0.41.20.x dream-source-ingest-titles follow-ups (v0.42+)
 
 - **TODO-V13-A (P2): `gbrain dream --max-pages <n>` plumbing.**
