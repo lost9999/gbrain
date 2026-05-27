@@ -715,6 +715,25 @@ export interface BrainEngine {
    */
   deletePage(slug: string, opts?: { sourceId?: string }): Promise<void>;
   /**
+   * v0.41.21.0 — batch hard-delete pages by slug. Returns the slugs that were
+   * actually deleted (subset of input — rows missing from the source are
+   * simply absent from the return). Cascades through content_chunks /
+   * page_links / chunk_relations via FK ON DELETE CASCADE.
+   *
+   * Single round-trip per internal batch (BATCH_SIZE=100, matching the
+   * v0.12.1 addLinksBatch precedent) via
+   * `DELETE ... WHERE slug = ANY($1) AND source_id = $2 RETURNING slug`.
+   * The Postgres impl wraps each batch in `withRetry(BULK_RETRY_OPTS)` for
+   * Supavisor circuit-breaker recovery (v0.41.19 cathedral); PGLite has no
+   * Supavisor concern and runs the bare DELETE.
+   *
+   * Per-batch abort: if `signal?.aborted` flips between batches, the engine
+   * returns the slugs deleted SO FAR (a short prefix). Caller distinguishes
+   * "partial via abort" from "partial via missing rows" by checking
+   * `signal?.aborted` after the await.
+   */
+  deletePages(slugs: string[], opts?: { sourceId?: string; signal?: AbortSignal }): Promise<string[]>;
+  /**
    * v0.26.5 — set `deleted_at = now()` on a page. Returns the slug if a row
    * was soft-deleted, null if no row matched (already soft-deleted OR not found).
    * Idempotent-as-null. The page stays in the DB and cascade rows (chunks,

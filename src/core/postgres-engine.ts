@@ -911,6 +911,38 @@ export class PostgresEngine implements BrainEngine {
     await sql`DELETE FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}`;
   }
 
+  /**
+   * v0.41.21.0 — batch hard-delete primitive. See BrainEngine.deletePages
+   * for the contract. BATCH_SIZE=100 matches addLinksBatch precedent.
+   * Each batch goes through `batchRetry` so Supavisor circuit-breaker
+   * recovery (v0.41.19) applies; audit-site is 'deletePages'.
+   *
+   * Returns deleted slugs in DB-order (no ORDER BY); caller doesn't depend
+   * on order, only on membership.
+   */
+  async deletePages(slugs: string[], opts?: { sourceId?: string; signal?: AbortSignal }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    const sourceId = opts?.sourceId ?? 'default';
+    const BATCH_SIZE = 100;
+    const deleted: string[] = [];
+    for (let i = 0; i < slugs.length; i += BATCH_SIZE) {
+      if (opts?.signal?.aborted) return deleted;
+      const batch = slugs.slice(i, i + BATCH_SIZE);
+      const rows = await this.batchRetry(
+        'deletePages',
+        opts?.signal,
+        () => this.sql<{ slug: string }[]>`
+          DELETE FROM pages
+          WHERE slug = ANY(${batch}::text[]) AND source_id = ${sourceId}
+          RETURNING slug
+        `,
+        batch.length,
+      );
+      for (const r of rows) deleted.push(r.slug);
+    }
+    return deleted;
+  }
+
   async softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null> {
     const sql = this.sql;
     const sourceId = opts?.sourceId;

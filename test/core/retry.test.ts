@@ -340,6 +340,8 @@ describe('BATCH_AUDIT_SITES typed enum + isBatchAuditSite guard (D10c codex)', (
     // break audit-attribution for the corresponding caller.
     const expected = new Set([
       'addLinksBatch', 'addTimelineEntriesBatch', 'upsertChunks',
+      // v0.41.25.0 — batched delete primitive (sync delete-loop rewrite)
+      'deletePages',
       'extract.links_inc', 'extract.timeline_inc',
       'extract.links_fs', 'extract.timeline_fs',
       'extract.links_db', 'extract.timeline_db',

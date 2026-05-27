@@ -1,5 +1,13 @@
 # TODOS
 
+## v0.41.25.0 batch-deletes wave follow-ups (v0.42+)
+
+Filed from the v0.41.25.0 plan-eng-review per D13. The wave shipped the
+delete-batching half of the original PR #1472 RFC; the full RFC's other
+hotspots already landed in v0.41.15.0 (#1506).
+
+- [ ] **Composite `(source_id, source_path) WHERE source_path IS NOT NULL` partial index.** Phase 1 of the batched delete loop runs `SELECT slug FROM pages WHERE source_path = ANY($1) AND source_id = $2 ORDER BY slug ASC`. The existing `pages_source_path_idx` (partial on `source_path IS NOT NULL`) covers the lookup but heap-filters by `source_id` afterward. On 4-source federated brains with overlapping source_paths this could heap-fetch a few thousand rows per batch before pruning. Composite index would shave that. Schema-migration territory; not blocking — the partial index is fine for current workloads. Files: `src/core/migrate.ts` (new MIGRATIONS entry), `docs/architecture/brains-and-sources.md` (mention the new index when discussing federated brain perf). Priority: P3 (latent, only material on 4+ source brains with heavy delete commits).
+
 ## v0.41.22.1 brainstorm judge fix-wave follow-ups (v0.42+)
 
 Filed from the v0.41.22.1 plan-eng-review per cross-model-tension D13c.

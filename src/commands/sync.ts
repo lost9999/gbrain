@@ -1235,25 +1235,85 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   // Process deletes first (prevents slug conflicts). SP-5: resolveSlugForPath
   // dispatches to the right slug shape so code file deletes hit the real page.
-  // v0.18.0+ multi-source: scope deletePage so we only delete the source-A
-  // row, not every same-slug row across all sources.
-  const deleteOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
+  //
+  // v0.41.21.0 — two-phase batched delete (supersedes PR #1538):
+  //   Phase 1: batched SELECT slug, source_path FROM pages WHERE
+  //     source_path = ANY($1) AND source_id = $2 ORDER BY slug ASC
+  //   Phase 2: engine.deletePages(batch, deleteOpts) — single DELETE per batch
+  //
+  // BATCH_SIZE=100 matches the v0.12.1 addLinksBatch/addTimelineEntriesBatch
+  // precedent + plays well with Supavisor (v0.41.19) recovery windows.
+  //
+  // D6 — when opts.sourceId is unset, scope BOTH the lookup AND the delete
+  // to source_id='default' (matches engine.deletePage default). Pre-fix
+  // resolveSlugByPathOrSourcePath(path, undefined) had a silent-no-op bug:
+  // returned slug from ANY source, downstream deletePage targeted 'default',
+  // DELETE no-op'd, file silently un-deleted. D6 closes this latent bug.
+  //
+  // D7 — ORDER BY slug ASC + Map.set keeps first → deterministic collapse
+  // of duplicate source_paths across batches/runs.
+  const DELETE_BATCH_SIZE = 100;
+  const scopedSourceId = opts.sourceId ?? 'default';
+  const deleteOpts = { sourceId: scopedSourceId, signal: opts.signal };
   if (filtered.deleted.length > 0) {
-    progress.start('sync.deletes', filtered.deleted.length);
-    for (const path of filtered.deleted) {
-      // v0.41.13.0 (T2 / D-V4-2): per-iteration abort check. Codex pass-3
-      // F8 caught that v3 only covered pull + add/modify. Refactor commits
-      // with hundreds of deletes can overshoot --timeout without this check.
+    // Phase 1: resolve slugs in batches
+    progress.start('sync.deletes.resolve', filtered.deleted.length);
+    const slugsToDelete: string[] = [];
+    for (let i = 0; i < filtered.deleted.length; i += DELETE_BATCH_SIZE) {
+      // v0.41.13.0 (T2 / D-V4-2): per-batch abort check preserves the
+      // --timeout contract. Bigger batches mean coarser abort granularity
+      // (up to BATCH_SIZE work between checks) — same trade-off as the
+      // other v0.41.21 batch primitives.
       if (opts.signal?.aborted) {
         progress.finish();
         return partial('timeout');
       }
-      const slug = await resolveSlugByPathOrSourcePath(engine, path, opts.sourceId);
-      await engine.deletePage(slug, deleteOpts);
-      pagesAffected.push(slug);
-      progress.tick(1, slug);
+      const pathBatch = filtered.deleted.slice(i, i + DELETE_BATCH_SIZE);
+      // D7: ORDER BY slug ASC pins deterministic Map collapse on duplicate
+      // source_paths. Without it, Postgres can return rows in any order
+      // and the first-wins Map.set picks differently across runs.
+      const rows = await engine.executeRaw<{ slug: string; source_path: string }>(
+        `SELECT slug, source_path FROM pages
+         WHERE source_path = ANY($1::text[]) AND source_id = $2
+         ORDER BY slug ASC`,
+        [pathBatch, scopedSourceId],
+      );
+      const byPath = new Map<string, string>();
+      for (const r of rows) {
+        // first-wins matches the ORDER BY; subsequent duplicates ignored.
+        if (!byPath.has(r.source_path)) byPath.set(r.source_path, r.slug);
+      }
+      for (const path of pathBatch) {
+        // Preserves fallback semantics: when DB has no row for this
+        // source_path (pre-migration brains, null source_path, etc.),
+        // derive the slug from the path shape. Mirrors the per-path
+        // resolveSlugByPathOrSourcePath contract.
+        const slug = byPath.get(path) ?? resolveSlugForPath(path);
+        slugsToDelete.push(slug);
+      }
+      progress.tick(pathBatch.length, `resolved ${Math.min(i + DELETE_BATCH_SIZE, filtered.deleted.length)}/${filtered.deleted.length}`);
     }
     progress.finish();
+
+    // Phase 2: batch delete (D11 — engine.deletePages non-optional, no fallback)
+    progress.start('sync.deletes', slugsToDelete.length);
+    for (let i = 0; i < slugsToDelete.length; i += DELETE_BATCH_SIZE) {
+      if (opts.signal?.aborted) {
+        progress.finish();
+        return partial('timeout');
+      }
+      const batch = slugsToDelete.slice(i, i + DELETE_BATCH_SIZE);
+      const deletedSlugs = await engine.deletePages(batch, deleteOpts);
+      // pagesAffected appends the INPUT batch (parity with pre-fix:
+      // downstream extract/embed sweeps no-op on missing pages, so the
+      // over-report on concurrent removal is benign).
+      pagesAffected.push(...batch);
+      progress.tick(batch.length, `deleted ${Math.min(i + DELETE_BATCH_SIZE, slugsToDelete.length)}/${slugsToDelete.length} (db confirmed ${deletedSlugs.length})`);
+    }
+    progress.finish();
+    // D1: NO trailing duplicate progress.finish() here. Pre-fix code had a
+    // single outer finish; PR #1538 added two inner finishes AND kept the
+    // outer one. We drop the outer to keep finish() balanced with start().
   }
 
   // Process renames (updateSlug preserves page_id, chunks, embeddings).

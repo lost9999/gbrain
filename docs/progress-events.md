@@ -138,7 +138,10 @@ Stable phase names shipped in v0.15.2:
 - `embed.pages`
 - `extract.links_fs`, `extract.timeline_fs`, `extract.links_db`, `extract.timeline_db`
 - `import.files`
-- `sync.deletes`, `sync.renames`, `sync.imports`
+- `sync.deletes.resolve`, `sync.deletes`, `sync.renames`, `sync.imports`
+  (v0.41.21.0 adds `sync.deletes.resolve` — the Phase-1 batched slug-lookup
+  pass that runs before `sync.deletes` proper. Both fire when a sync commit
+  removes any files.)
 - `migrate.copy_pages`, `migrate.copy_links`
 - `repair_jsonb.run`, `repair_jsonb.<table>.<column>`
 - `backlinks.scan`

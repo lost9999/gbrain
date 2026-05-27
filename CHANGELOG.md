@@ -2,6 +2,123 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.25.0] - 2026-05-27
+
+**Bulk deletes no longer jam sync for two days.**
+
+If you ever pushed a single commit that deleted thousands of files —
+folder reorg, atom-backfill cleanup, a sweep of stale notes — the next
+`gbrain sync` would just sit there. For real. On a 73K-file delete
+commit the sync cron used to grind through 146,000 individual database
+round-trips (one slug lookup + one delete per file) and time out
+every run for a couple of days while it churned. Other sources in
+federated brains went stale behind it; the brain doctor score dropped
+to 0; you couldn't tell from outside whether anything was happening.
+
+This release rewrites sync's delete pass to batch both halves. The same
+73K-file commit now lands in about two minutes — roughly 1,500x faster
+on the headline scenario — and the per-batch shape inherits the
+Supavisor circuit-breaker retry cathedral from v0.41.19, so transient
+connection blips don't lose work.
+
+A latent bug closes alongside: on brains that didn't pass a `--source`
+flag, the old per-file resolver could pull a slug from the wrong source
+and then issue a delete against `source_id='default'`, which would
+silently no-op. Files stayed in the brain after the file was already
+gone from disk. The new path scopes the lookup AND the delete to the
+same source, so deletions actually happen.
+
+**How to take advantage of v0.41.25.0:** Run `gbrain upgrade`. The next
+sync after upgrade picks up the batched path automatically. No schema
+migration, no config change, no manual step.
+
+**What you'd see in a concrete example:**
+
+| Scenario | Pre-fix | Post-fix |
+|---|---|---|
+| 73K-file delete commit | ~5 hours, cron times out every run | ~2 minutes, one cron run |
+| 1K-file delete commit | ~4 minutes | ~3 seconds |
+| Sibling-source survival on no-`--source` sync | Sometimes wrong-source slug got resolved (silent no-op) | Lookup AND delete scoped to `default`; sibling sources stay untouched |
+| `--timeout` mid-delete | Aborted after current per-file delete | Aborts at the next batch boundary (≤100 deletes of work in-flight) |
+
+**The mechanism in one paragraph.** The pre-fix delete loop did
+`for path in deletes: SELECT slug WHERE source_path = path; DELETE WHERE slug = ?`
+— two round-trips per file. The post-fix splits into two phases that
+each consume the file list at 100-rows-per-batch (the same precedent
+as `addLinksBatch` from v0.12.1): Phase 1 is
+`SELECT slug, source_path FROM pages WHERE source_path = ANY($1) AND source_id = $2 ORDER BY slug ASC`
+(the `ORDER BY` makes duplicate-source_path collapse deterministic),
+Phase 2 is `engine.deletePages(batch)` which fires
+`DELETE FROM pages WHERE slug = ANY($1) AND source_id = $2 RETURNING slug`.
+Both engines (Postgres + PGLite) implement `deletePages` so there's no
+fallback branching; the Postgres path wraps each batch in `withRetry`
+so a Supavisor blip mid-batch recovers cleanly without losing rows.
+
+**Scope honesty.** This fixes the delete-specific hotspot only. The
+parallel chunked-sync RFC that v0.41.15.0 productionized (per-source
+`--timeout`, `--break-lock-if-stale`, `--independent` mode) is what
+prevents general-purpose pipeline jamming; the work in this release
+is the delete-batching half. Renames, imports, extraction, embedding,
+and lock contention can still cause sync slowness in their own ways.
+
+**What we caught before merging.** Codex outside voice (run during
+`/plan-eng-review`) flagged 12 substantive issues the in-skill review
+missed. The most important: the no-`source` path had a silent-no-op
+bug in pre-fix code that the original PR #1538 would have propagated
+across 73K rows in one batch instead of one at a time. The fix scopes
+both the lookup AND the delete to `source_id='default'` when no
+`--source` is set. Other catches: deterministic `ORDER BY slug ASC` on
+duplicate source_paths (was non-deterministic), `withRetry` integration
+that the original PR omitted, query-count regression test that proves
+the batching shape can't quietly revert, and an over-claim cleanup
+("prevents ANY source from jamming" is the combined effect of #1472 +
+this PR; this PR alone fixes the delete-specific hotspot).
+
+### Itemized changes
+
+**New engine surface.**
+- `BrainEngine.deletePages(slugs, opts?): Promise<string[]>` — non-optional
+  on the interface, returns the actually-deleted slugs (a subset of input,
+  excluding rows that were missing or already cascade-deleted).
+- `PostgresEngine.deletePages` — internal batching at 100, each batch
+  wrapped in `withRetry(BULK_RETRY_OPTS)` with `auditSite: 'deletePages'`.
+  Per-batch abort check via `opts.signal`.
+- `PGLiteEngine.deletePages` — same batching shape, no `withRetry`
+  (PGLite is single-writer, no Supavisor concern).
+- `BATCH_AUDIT_SITES` const enum extended with `'deletePages'`. CI guard
+  at `scripts/check-batch-audit-site.sh` enforces enum membership.
+
+**Sync rewrite.**
+- `src/commands/sync.ts` delete loop replaced with the two-phase batched
+  path. New `sync.deletes.resolve` progress event fires for Phase 1; the
+  existing `sync.deletes` event covers Phase 2. Per-batch `--timeout`
+  abort checks preserve the v0.41.13.0 D-V4-2 contract.
+
+**Tests.**
+- New `test/sync-batch-deletes.test.ts` (12 PGLite cases): engine-level
+  contract (empty, missing, scoping, abort), sync-level integration via
+  `performSync` against a synthetic git repo (D6 no-`source` scoping
+  regression, D7 deterministic `ORDER BY`, source_path-NULL fallback,
+  D9 query-count regression), D1 structural regression (no trailing
+  duplicate `progress.finish()`).
+- `test/e2e/sync.test.ts` extended with 3 real-Postgres cases: FK
+  CASCADE through `content_chunks`, 250-file end-to-end batch shape,
+  abort mid-sync returns `partial('timeout')` with empty
+  `pagesAffected` when aborted before any batch ran.
+
+**Docs.**
+- `docs/ENGINES.md` documents `deletePages` alongside `deletePage`.
+- `docs/progress-events.md` documents `sync.deletes.resolve`.
+
+**For contributors.**
+- Productionized from community PR #1538 by `@garrytan-agents` per the
+  CLAUDE.md community-PR-wave workflow. The 12 review-driven improvements
+  layered on top: D1 single-finish fix, D6 default-source scoping (kills
+  a pre-existing latent silent-no-op bug), D7 deterministic `ORDER BY`,
+  D8 `withRetry` integration, D9 query-count regression test, D10
+  `Promise<string[]>` return shape (vs the original `Promise<number>`),
+  D11 PGLite parity with no fallback branch. Thanks `@garrytan-agents`.
+
 ## [0.41.22.1] - 2026-05-27
 
 **Your `gbrain brainstorm` and `gbrain lsd` calls now actually score the ideas they generate.**

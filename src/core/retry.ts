@@ -77,6 +77,7 @@ export const BATCH_AUDIT_SITES = [
   'addLinksBatch',
   'addTimelineEntriesBatch',
   'upsertChunks',
+  'deletePages',
   // extract.ts per-site labels.
   'extract.links_inc',
   'extract.timeline_inc',

@@ -3042,8 +3042,19 @@ export interface BrainEngine {
 
   // Pages CRUD
   getPage(slug: string): Promise<Page | null>;
-  putPage(slug: string, page: PageInput): Promise<Page>;
-  deletePage(slug: string): Promise<void>;
+  putPage(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page>;
+  deletePage(slug: string, opts?: { sourceId?: string }): Promise<void>;
+  /**
+   * v0.41.21.0 — batch hard-delete primitive (supersedes per-slug deletePage
+   * loops in sync's delete phase). Returns the actually-deleted slugs
+   * (subset of input). Internally batches at 100 to match v0.12.1
+   * addLinksBatch/addTimelineEntriesBatch precedent. PostgresEngine wraps
+   * each batch in withRetry(BULK_RETRY_OPTS) for Supavisor circuit-breaker
+   * recovery; PGLite runs the bare DELETE. Per-batch abort via opts.signal.
+   * Cascades through content_chunks / page_links / chunk_relations via
+   * FK ON DELETE CASCADE — same semantics as deletePage.
+   */
+  deletePages(slugs: string[], opts?: { sourceId?: string; signal?: AbortSignal }): Promise<string[]>;
   listPages(filters: PageFilters): Promise<Page[]>;
 
   // Search

@@ -554,3 +554,226 @@ describeE2E('E2E: sync --skip-failed structured summary loop (v0.22.12, issue #5
     expect(finalSummary).toEqual([{ code: 'SLUG_MISMATCH', count: 2 }]);
   });
 });
+
+/**
+ * E2E: batch delete pipeline against real Postgres (v0.41.21.0).
+ *
+ * Closes the production hotspot from PR #1538 — a single commit deleting
+ * 73K files used to take ~5 hours (146K individual DB round-trips). The
+ * v0.41.21.0 fix batches both phases:
+ *   - Phase 1: SELECT slug FROM pages WHERE source_path = ANY($1) at
+ *     BATCH_SIZE=100 → ceil(N/100) round-trips
+ *   - Phase 2: engine.deletePages([100 slugs]) → ceil(N/100) DELETEs with
+ *     RETURNING slug, each wrapped in withRetry(BULK_RETRY_OPTS) for
+ *     Supavisor circuit-breaker recovery (v0.41.19 cathedral)
+ *
+ * These E2E cases run against real Postgres so the FK CASCADE through
+ * content_chunks, the array-binding wire format, and the withRetry
+ * audit-emission integration all exercise the production path (not the
+ * PGLite WASM stand-in).
+ */
+describeE2E('E2E: batch sync deletes (v0.41.21.0)', () => {
+  let repoPath: string;
+
+  beforeAll(async () => {
+    await setupDB();
+  }, 30_000);
+
+  afterAll(async () => {
+    await teardownDB();
+    if (repoPath) rmSync(repoPath, { recursive: true, force: true });
+  });
+
+  test('engine.deletePages returns deleted slugs and cascades through content_chunks', async () => {
+    const engine = getEngine();
+
+    // Seed: insert 100 pages directly + a few chunk rows so we can verify
+    // FK cascade. Use a unique source so the assertion isolates from any
+    // pre-existing test data on the same DB.
+    const sourceId = `e2e-batch-${Date.now()}`;
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [sourceId],
+    );
+
+    const slugs = Array.from({ length: 100 }, (_, i) => `bdel/${sourceId}/slug-${String(i).padStart(3, '0')}`);
+    for (const slug of slugs) {
+      const page = await engine.putPage(slug, {
+        type: 'concept',
+        title: slug,
+        compiled_truth: `Body for ${slug}`,
+        timeline: '',
+        frontmatter: { type: 'concept' },
+      }, { sourceId });
+      // Add a content chunk so we can verify CASCADE.
+      await engine.upsertChunks(slug, [
+        { chunk_index: 0, chunk_text: page.compiled_truth, chunk_source: 'compiled_truth' },
+      ], { sourceId });
+    }
+
+    // Sanity: chunks exist before delete.
+    const beforeChunks = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM content_chunks WHERE page_id IN
+         (SELECT id FROM pages WHERE source_id = $1)`,
+      [sourceId],
+    );
+    expect(beforeChunks[0].n).toBe(100);
+
+    // Single-call batch delete.
+    const deleted = await engine.deletePages(slugs, { sourceId });
+    expect(deleted.length).toBe(100);
+    expect(deleted.sort()).toEqual([...slugs].sort());
+
+    // FK CASCADE removed the chunks too.
+    const afterChunks = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM content_chunks WHERE page_id IN
+         (SELECT id FROM pages WHERE source_id = $1)`,
+      [sourceId],
+    );
+    expect(afterChunks[0].n).toBe(0);
+
+    // Pages gone.
+    const afterPages = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1`,
+      [sourceId],
+    );
+    expect(afterPages[0].n).toBe(0);
+
+    // Cleanup the source row.
+    await engine.executeRaw(`DELETE FROM sources WHERE id = $1`, [sourceId]);
+  }, 60_000);
+
+  test('end-to-end performSync deleting 250 files batches into ≤3 SELECT + ≤3 deletePages calls', async () => {
+    repoPath = mkdtempSync(join(tmpdir(), 'gbrain-e2e-batch-deletes-'));
+    execSync('git init -q', { cwd: repoPath, stdio: 'pipe' });
+    execSync('git config user.email "t@t.com"', { cwd: repoPath, stdio: 'pipe' });
+    execSync('git config user.name "T"', { cwd: repoPath, stdio: 'pipe' });
+
+    // Seed: 250 markdown files in concepts/, commit, first-sync, then
+    // delete all 250 + commit, then incremental sync. The incremental
+    // pass is the one that exercises the delete loop.
+    mkdirSync(join(repoPath, 'concepts'), { recursive: true });
+    for (let i = 0; i < 250; i++) {
+      const name = `e2e-bulk-${String(i).padStart(4, '0')}`;
+      writeFileSync(
+        join(repoPath, 'concepts', `${name}.md`),
+        `---\ntype: concept\ntitle: ${name}\n---\n\nBaseline.\n`,
+      );
+    }
+    execSync('git add -A && git commit -q -m initial', { cwd: repoPath, stdio: 'pipe' });
+
+    const { performSync } = await import('../../src/commands/sync.ts');
+    const engine = getEngine();
+
+    const first = await performSync(engine, {
+      repoPath, full: true, noPull: true, noEmbed: true, noExtract: true,
+    });
+    expect(['first_sync', 'synced']).toContain(first.status);
+
+    // Sanity: pages landed.
+    const seeded = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM pages WHERE slug LIKE 'concepts/e2e-bulk-%'`,
+    );
+    expect(seeded[0].n).toBe(250);
+
+    // Wrap the engine in a counting proxy.
+    let phase1Selects = 0;
+    let phase2DeletePagesCalls = 0;
+    const origExec = engine.executeRaw.bind(engine);
+    const origDel = engine.deletePages.bind(engine);
+    (engine.executeRaw as unknown) = (async <T>(sql: string, params?: unknown[]) => {
+      const s = sql.toLowerCase();
+      if (s.includes('select') && s.includes('source_path') && s.includes('any(') && s.includes('order by')) {
+        phase1Selects++;
+      }
+      return origExec<T>(sql, params);
+    });
+    (engine.deletePages as unknown) = (async (
+      ds: string[],
+      opts?: { sourceId?: string; signal?: AbortSignal },
+    ) => {
+      phase2DeletePagesCalls++;
+      return origDel(ds, opts);
+    });
+
+    try {
+      rmSync(join(repoPath, 'concepts'), { recursive: true, force: true });
+      execSync('git add -A && git commit -q -m bulk-delete', { cwd: repoPath, stdio: 'pipe' });
+      await performSync(engine, { repoPath, noPull: true, noEmbed: true, noExtract: true });
+    } finally {
+      (engine.executeRaw as unknown) = origExec;
+      (engine.deletePages as unknown) = origDel;
+    }
+
+    // 250 / BATCH_SIZE=100 = 3 batches each.
+    expect(phase1Selects).toBeGreaterThan(0);
+    expect(phase1Selects).toBeLessThanOrEqual(3);
+    expect(phase2DeletePagesCalls).toBeGreaterThan(0);
+    expect(phase2DeletePagesCalls).toBeLessThanOrEqual(3);
+
+    // All 250 pages gone.
+    const remaining = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM pages WHERE slug LIKE 'concepts/e2e-bulk-%'`,
+    );
+    expect(remaining[0].n).toBe(0);
+  }, 120_000);
+
+  test('abort signal mid-sync returns partial(timeout) with completed-batch pagesAffected', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-e2e-abort-deletes-'));
+    try {
+      execSync('git init -q', { cwd: repo, stdio: 'pipe' });
+      execSync('git config user.email "t@t.com"', { cwd: repo, stdio: 'pipe' });
+      execSync('git config user.name "T"', { cwd: repo, stdio: 'pipe' });
+
+      // Seed: 300 files so Phase 1 has 3 batches. Abort after batch 1 →
+      // expect pagesAffected to reflect ≤ 100 deletes (Phase 2 didn't run
+      // because abort fires at the top of every Phase-1 batch).
+      mkdirSync(join(repo, 'concepts'), { recursive: true });
+      for (let i = 0; i < 300; i++) {
+        const name = `e2e-abort-${String(i).padStart(4, '0')}`;
+        writeFileSync(
+          join(repo, 'concepts', `${name}.md`),
+          `---\ntype: concept\ntitle: ${name}\n---\n\nBaseline.\n`,
+        );
+      }
+      execSync('git add -A && git commit -q -m initial', { cwd: repo, stdio: 'pipe' });
+
+      const { performSync } = await import('../../src/commands/sync.ts');
+      const engine = getEngine();
+      await performSync(engine, { repoPath: repo, full: true, noPull: true, noEmbed: true, noExtract: true });
+
+      // Delete all 300, commit. Abort the signal before sync starts so the
+      // very first batch check trips. partial('timeout') returns; pagesAffected
+      // is empty because we aborted before any Phase 2 batch ran.
+      rmSync(join(repo, 'concepts'), { recursive: true, force: true });
+      execSync('git add -A && git commit -q -m abort-delete', { cwd: repo, stdio: 'pipe' });
+
+      const ac = new AbortController();
+      ac.abort();
+      const result = await performSync(engine, {
+        repoPath: repo, noPull: true, noEmbed: true, noExtract: true, signal: ac.signal,
+      });
+      expect(result.status).toBe('partial');
+      // pagesAffected is the truthful record of completed deletes — should
+      // be empty since the abort fires at the top of Phase 1 (before any
+      // deletePages call).
+      expect(result.pagesAffected.length).toBe(0);
+
+      // The 300 pages are STILL present (abort happened before delete).
+      const remaining = await engine.executeRaw<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM pages WHERE slug LIKE 'concepts/e2e-abort-%'`,
+      );
+      expect(remaining[0].n).toBe(300);
+
+      // Cleanup: hard-delete the remaining 300 directly so the next test run
+      // doesn't see them.
+      const allSlugs = (await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM pages WHERE slug LIKE 'concepts/e2e-abort-%'`,
+      )).map(r => r.slug);
+      await engine.deletePages(allSlugs);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 90_000);
+});

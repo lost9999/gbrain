@@ -900,6 +900,30 @@ export class PGLiteEngine implements BrainEngine {
     );
   }
 
+  /**
+   * v0.41.21.0 — batch hard-delete primitive. See BrainEngine.deletePages
+   * for the contract. BATCH_SIZE=100 matches addLinksBatch precedent.
+   * PGLite is single-writer with no Supavisor concern, so no withRetry
+   * wrapper here (matches the pre-existing engine policy split: only the
+   * Postgres engine batch primitives carry the retry cathedral).
+   */
+  async deletePages(slugs: string[], opts?: { sourceId?: string; signal?: AbortSignal }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    const sourceId = opts?.sourceId ?? 'default';
+    const BATCH_SIZE = 100;
+    const deleted: string[] = [];
+    for (let i = 0; i < slugs.length; i += BATCH_SIZE) {
+      if (opts?.signal?.aborted) return deleted;
+      const batch = slugs.slice(i, i + BATCH_SIZE);
+      const { rows } = await this.db.query<{ slug: string }>(
+        'DELETE FROM pages WHERE slug = ANY($1::text[]) AND source_id = $2 RETURNING slug',
+        [batch, sourceId],
+      );
+      for (const r of rows) deleted.push(r.slug);
+    }
+    return deleted;
+  }
+
   async softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null> {
     // Idempotent-as-null: only flip rows currently active. Source filter is
     // optional; without it the first matching row across sources gets soft-deleted.
