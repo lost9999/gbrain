@@ -731,6 +731,9 @@ export async function hybridSearch(
   // flush is fire-and-forget on 60s / 100-call thresholds. The hot path
   // never waits.
   let lastResultsCount = 0;
+  // T7 — rank-1 base_score for the telemetry drift signal. Set alongside
+  // lastResultsCount at each return path; undefined when there are no results.
+  let lastRank1Score: number | undefined;
   const emitMeta = (meta: HybridSearchMeta): void => {
     try {
       opts?.onMeta?.(meta);
@@ -738,7 +741,7 @@ export async function hybridSearch(
       // swallow — capture telemetry is best-effort
     }
     try {
-      recordSearchTelemetry(engine, meta, { results_count: lastResultsCount });
+      recordSearchTelemetry(engine, meta, { results_count: lastResultsCount, rank1_score: lastRank1Score });
     } catch {
       // swallow — telemetry must never break the search hot path.
     }
@@ -837,6 +840,7 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     lastResultsCount = noEmbedBudgeted.length;
+    lastRank1Score = noEmbedBudgeted[0] ? (noEmbedBudgeted[0].base_score ?? noEmbedBudgeted[0].score) : undefined;
     emitMeta({
       vector_enabled: false,
       detail_resolved: detailResolved,
@@ -1052,6 +1056,7 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     lastResultsCount = kwBudgeted.length;
+    lastRank1Score = kwBudgeted[0] ? (kwBudgeted[0].base_score ?? kwBudgeted[0].score) : undefined;
     emitMeta({
       vector_enabled: false,
       detail_resolved: detailResolved,
@@ -1219,6 +1224,7 @@ export async function hybridSearch(
   // the same budget behavior as the production query op.
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, resolvedMode.tokenBudget);
   lastResultsCount = budgeted.length;
+  lastRank1Score = budgeted[0] ? (budgeted[0].base_score ?? budgeted[0].score) : undefined;
   emitMeta({
     vector_enabled: true,
     detail_resolved: detailResolved,
