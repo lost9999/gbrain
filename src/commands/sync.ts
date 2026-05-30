@@ -2338,14 +2338,29 @@ See also:
         // Deferred path: print an FYI, NEVER exit 2. The backfill cap is the
         // real money gate (D1/D4).
         const capUsd = await resolveBackfillCapUsd(engine);
+        // v0.41.30 (TODO-2): surface already-queued backfill jobs so a cron
+        // operator sees work is enqueued, not lost. Best-effort — minion_jobs
+        // may not exist on a brain that never ran a worker.
+        let queuedBackfills = 0;
+        try {
+          const r = await engine.executeRaw<{ n: number }>(
+            `SELECT COUNT(*)::int AS n FROM minion_jobs
+              WHERE name = 'embed-backfill'
+                AND status IN ('waiting','active','delayed','waiting-children')`,
+          );
+          queuedBackfills = Number(r[0]?.n) || 0;
+        } catch {
+          queuedBackfills = 0;
+        }
         const deferredMsg =
           `sync --all: embedding deferred to backfill jobs ` +
           `(capped $${capUsd}/source/24h, not charged by this sync). ` +
           `Current backlog ~${staleChars.toLocaleString()} chars (~$${staleCostUsd.toFixed(2)} on ` +
-          `${embeddingModelName}) across ${sources.length} source(s).`;
+          `${embeddingModelName}) across ${sources.length} source(s); ` +
+          `${queuedBackfills} backfill job(s) queued.`;
         if (dryRun) {
           if (jsonOut) {
-            console.log(JSON.stringify({ status: 'dry_run', mode, gate: 'dry_run', staleChars, staleCostUsd, capUsd, floorUsd, model: embeddingModelName }));
+            console.log(JSON.stringify({ status: 'dry_run', mode, gate: 'dry_run', staleChars, staleCostUsd, capUsd, floorUsd, queuedBackfills, model: embeddingModelName }));
           } else {
             console.log(deferredMsg);
             console.log('--dry-run: exit without syncing.');
@@ -2353,7 +2368,7 @@ See also:
           return;
         }
         if (jsonOut) {
-          console.log(JSON.stringify({ status: 'deferred', mode, gate: 'deferred_notice', staleChars, staleCostUsd, capUsd, floorUsd, model: embeddingModelName }));
+          console.log(JSON.stringify({ status: 'deferred', mode, gate: 'deferred_notice', staleChars, staleCostUsd, capUsd, floorUsd, queuedBackfills, model: embeddingModelName }));
         } else {
           console.log(deferredMsg);
         }
@@ -2915,6 +2930,13 @@ export interface SyncStatusReportSource {
   chunks_total: number;
   chunks_unembedded: number;
   embedding_coverage_pct: number;
+  // v0.41.30: embed-backfill job visibility (federated_v2 defers embedding
+  // to these jobs; without this an operator can't see queued/lagging work
+  // after `sync --all` exits 0). Best-effort — all 0 / null on brains
+  // without the minion_jobs table.
+  backfill_queued: number;
+  backfill_active: number;
+  backfill_last_completed_at: string | null;
 }
 
 export interface SyncStatusReport {
@@ -3016,6 +3038,43 @@ export async function buildSyncStatusReport(
     });
   }
 
+  // v0.41.30: per-source embed-backfill job state. Best-effort — the
+  // minion_jobs table doesn't exist on every brain (a brain that never ran
+  // a worker has the pre-minions schema), and the dashboard must not crash
+  // for that. A failure → empty map → all sources report 0/null.
+  type BackfillRow = {
+    source_id: string | null;
+    queued: string | number;
+    active: string | number;
+    last_completed_at: string | Date | null;
+  };
+  const backfillMap = new Map<string, { queued: number; active: number; last_completed_at: string | null }>();
+  if (sourceIds.length > 0) {
+    try {
+      const backfillRows = await engine.executeRaw<BackfillRow>(
+        `SELECT data->>'sourceId' AS source_id,
+                COUNT(*) FILTER (WHERE status IN ('waiting','delayed','waiting-children'))::int AS queued,
+                COUNT(*) FILTER (WHERE status = 'active')::int AS active,
+                MAX(finished_at) FILTER (WHERE status = 'completed') AS last_completed_at
+           FROM minion_jobs
+          WHERE name = 'embed-backfill' AND data->>'sourceId' = ANY($1::text[])
+          GROUP BY data->>'sourceId'`,
+        [sourceIds],
+      );
+      for (const r of backfillRows) {
+        if (!r.source_id) continue;
+        const last = r.last_completed_at;
+        backfillMap.set(r.source_id, {
+          queued: Number(r.queued) || 0,
+          active: Number(r.active) || 0,
+          last_completed_at: last == null ? null : (last instanceof Date ? last.toISOString() : last),
+        });
+      }
+    } catch {
+      // minion_jobs absent / unreadable → leave backfillMap empty.
+    }
+  }
+
   const now = Date.now();
   const out: SyncStatusReportSource[] = sources.map((src) => {
     const cfgEntry = (src.config || {}) as { syncEnabled?: boolean };
@@ -3052,6 +3111,9 @@ export async function buildSyncStatusReport(
       chunks_total: counts.chunks_total,
       chunks_unembedded: counts.chunks_unembedded,
       embedding_coverage_pct: embeddingCoveragePct,
+      backfill_queued: backfillMap.get(src.id)?.queued ?? 0,
+      backfill_active: backfillMap.get(src.id)?.active ?? 0,
+      backfill_last_completed_at: backfillMap.get(src.id)?.last_completed_at ?? null,
     };
   });
 
@@ -3092,7 +3154,7 @@ export function printSyncStatusReport(
     write('  (no sources registered)');
     return;
   }
-  const headers = ['SOURCE', 'STATE', 'STALENESS', 'PAGES', 'EMBEDDED', 'LAST SYNC'];
+  const headers = ['SOURCE', 'STATE', 'STALENESS', 'PAGES', 'EMBEDDED', 'BACKFILL', 'LAST SYNC'];
   const rows = report.sources.map((s) => {
     const stale = s.staleness_hours === null
       ? 'never'
@@ -3100,21 +3162,28 @@ export function printSyncStatusReport(
     const stateBits: string[] = [];
     if (!s.sync_enabled) stateBits.push('disabled');
     stateBits.push(s.staleness_class);
+    // BACKFILL: active beats queued beats idle for the at-a-glance cell.
+    const backfill = s.backfill_active > 0
+      ? `active(${s.backfill_active})`
+      : s.backfill_queued > 0
+        ? `queued(${s.backfill_queued})`
+        : 'idle';
     return [
       s.name,
       stateBits.join(','),
       stale,
       String(s.pages),
       `${s.embedding_coverage_pct}%`,
+      backfill,
       s.last_sync_at ?? '(never)',
     ];
   });
   const widths = headers.map((h, i) =>
     Math.max(h.length, ...rows.map((r) => r[i].length)),
   );
-  // Numeric columns (PAGES at index 3, EMBEDDED at index 4, STALENESS
-  // at index 2) right-pad-left so digits align cleanly. Text columns
-  // left-pad-right per the existing `sources list` convention.
+  // Numeric columns (STALENESS=2, PAGES=3, EMBEDDED=4) right-pad-left so
+  // digits align cleanly. Text columns (incl. BACKFILL=5) left-pad-right
+  // per the existing `sources list` convention.
   const NUMERIC_COLS = new Set([2, 3, 4]);
   const fmt = (cells: string[]) =>
     cells.map((c, i) => (NUMERIC_COLS.has(i) ? c.padStart(widths[i]) : c.padEnd(widths[i]))).join('  ');
