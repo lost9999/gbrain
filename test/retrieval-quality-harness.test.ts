@@ -85,19 +85,17 @@ describe('evaluateGate', () => {
 });
 
 describe('NamedThingBench fixture privacy guard', () => {
-  test('fixture uses placeholder names only (no real network/brain leakage)', async () => {
+  test('fixture uses placeholder names only (every slug is an *-example)', async () => {
     const { readFileSync } = await import('fs');
     const { join } = await import('path');
     const raw = readFileSync(join(import.meta.dir, 'fixtures/retrieval-quality/namedthing.jsonl'), 'utf8').toLowerCase();
-    // Banned: real agent/person/project names per CLAUDE.md privacy rule.
-    for (const banned of ['wintermute', 'mingtang', 'hall of light\\b.*real', 'garry', 'baku', 'argus', 'sanctum']) {
-      // 'hall of light' is allowed ONLY as a placeholder alias example here, so
-      // we ban the truly-identifying names; keep the list conservative.
-      if (banned.includes('\\b')) continue;
-      expect(raw).not.toContain(banned);
-    }
-    // Every relevant/forbidden slug must be an *-example placeholder.
-    for (const m of raw.matchAll(/"(projects|people|notes|companies)\/([a-z0-9-]+)"/g)) {
+    // The load-bearing guard: every relevant/forbidden slug must be an
+    // `*-example` placeholder, so no real brain page can be referenced. (We
+    // don't enumerate banned real names here — listing them as string literals
+    // would itself trip scripts/check-test-real-names.sh.)
+    const slugs = [...raw.matchAll(/"(projects|people|notes|companies)\/([a-z0-9-]+)"/g)];
+    expect(slugs.length).toBeGreaterThan(0);
+    for (const m of slugs) {
       expect(m[2]).toContain('example');
     }
   });
