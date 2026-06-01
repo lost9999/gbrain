@@ -752,6 +752,23 @@ describe('AGENT_IDS', () => {
   });
 });
 
+describe('LEARN_INSTRUCTION names only real MCP tools', () => {
+  // The self-orientation block is pasted into a connected agent verbatim. Every
+  // tool it names MUST be MCP-exposed, or the agent calls an "unknown tool".
+  // The exposed set is pinned end-to-end by test/e2e/serve-stdio-roundtrip.ts.
+  test('names put_page (the real MCP write tool), not capture (CLI-only)', () => {
+    expect(LEARN_INSTRUCTION).toContain('put_page');
+    // `capture` is a CLI-only convenience wrapper, not an MCP tool — naming it
+    // here told connected agents to call a tool the server does not expose.
+    expect(LEARN_INSTRUCTION).not.toContain('capture');
+  });
+  test('still steers the agent to get_brain_identity + list_skills + brain-first search', () => {
+    expect(LEARN_INSTRUCTION).toContain('get_brain_identity');
+    expect(LEARN_INSTRUCTION).toContain('list_skills');
+    expect(LEARN_INSTRUCTION.toLowerCase()).toContain('search the brain before');
+  });
+});
+
 describe('runConnect --oauth', () => {
   test('perplexity --oauth with BYO client id/secret prints the OAuth connector block', async () => {
     const r = await runWithExitCapture(

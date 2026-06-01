@@ -66,11 +66,14 @@ export const AGENT_SPECS: Record<AgentId, AgentSpec> = {
 
 export const AGENT_IDS: AgentId[] = ['claude-code', 'codex', 'perplexity', 'generic'];
 
+// The named tools MUST be real MCP-exposed ops (verified by the round-trip
+// E2E). `capture` is intentionally absent: it's a CLI-only convenience wrapper,
+// not an MCP tool — the agent writes over MCP with `put_page`.
 export const LEARN_INSTRUCTION =
   'Once connected, call the `get_brain_identity` tool (whose brain this is), then ' +
   '`list_skills` (everything it can do; if it errors, the host has not enabled skill ' +
   'publishing — these core tools still work: search, query, get_page, put_page, ' +
-  'capture, think, find_experts). Always search the brain before answering or writing.';
+  'think, find_experts). Always search the brain before answering or writing.';
 
 const SECRET_NOTE =
   'Note: that bearer token is a long-lived, full-access secret — keep it private and ' +
