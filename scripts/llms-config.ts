@@ -87,6 +87,11 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
+        // Excluded from llms-full.txt (stays linked in llms.txt) to keep the
+        // single-fetch bundle under FULL_SIZE_BUDGET as CLAUDE.md grows. This is
+        // a value-explainer, not load-bearing operational reference for an agent
+        // reading the bundle — the right thing to link rather than inline.
+        includeInFull: false,
         title: "docs/what-schemas-unlock.md",
         description:
           "Why schemas matter: 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) + the structural argument for typed page kinds. Read this before pitching schema authoring (v0.40.7.0).",
