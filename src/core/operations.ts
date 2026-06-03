@@ -4525,12 +4525,22 @@ const run_skillopt: Operation = {
     max_cost_usd: { type: 'number', description: 'Default 5.00' },
     no_mutate: { type: 'boolean', description: 'Write proposed.md without replacing SKILL.md' },
     allow_mutate_bundled: { type: 'boolean', description: 'Required to mutate bundled skills' },
+    held_out_path: { type: 'string', description: 'Path to a held-out test set (JSONL). REQUIRED (>=5 rows) to mutate a bundled skill in place — otherwise the run hard-refuses. Remote callers: must resolve within the skills directory.' },
     dry_run: { type: 'boolean', description: 'Cost preview, no LLM calls' },
   },
   mutating: true,
   scope: 'admin',
   localOnly: false,
   handler: async (ctx, p) => {
+    // SECURITY: skill_name is joined into filesystem paths (SKILL.md, default
+    // benchmark, checkpoint, history, best.md, proposed.md). A traversal-shaped
+    // name (`../`, absolute) would escape the skills dir even WITH the
+    // caller-supplied-path confinement below. Validate kebab-only up front so
+    // every derived path is contained by construction. Applies to all callers.
+    const skillNameRaw = (p.skill_name as string) ?? '';
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(skillNameRaw)) {
+      throw new OperationError(`run_skillopt: skill_name must be kebab-case (matching ^[a-z0-9][a-z0-9-]*$); got '${skillNameRaw}'`, 'invalid_params');
+    }
     if (ctx.remote !== false) {
       // Remote: enforce per-skill allowlist read from config.
       // `skillopt.allowed_skills` is a JSON-array config of skill names
@@ -4560,6 +4570,37 @@ const run_skillopt: Operation = {
     const skillName = p.skill_name as string;
     const benchmarkPath = (p.benchmark_path as string) ??
       `${skillsDir}/${skillName}/skillopt-benchmark.jsonl`;
+    const heldOutPath = p.held_out_path as string | undefined;
+    // SECURITY: remote callers must NOT be able to point benchmark/held-out at
+    // arbitrary host files (loadBenchmark → fs.readFileSync would otherwise be an
+    // arbitrary-read + existence oracle). Confine any caller-supplied path to the
+    // skills directory. Local CLI callers (ctx.remote === false) are unconfined.
+    if (ctx.remote !== false) {
+      const nodePath = await import('node:path');
+      const nodeFs = await import('node:fs');
+      const rootReal = (() => {
+        try { return nodeFs.realpathSync(skillsDir); } catch { return nodePath.resolve(skillsDir); }
+      })();
+      const confine = (label: string, candidate: string | undefined): void => {
+        if (!candidate) return;
+        const resolved = nodePath.resolve(candidate);
+        let real = resolved;
+        try {
+          real = nodeFs.realpathSync(resolved);
+        } catch {
+          // Not yet present: canonicalize the nearest existing ancestor so a
+          // legit in-dir path under a symlinked skillsDir (e.g. macOS /tmp ->
+          // /private/tmp, Conductor worktrees) isn't wrongly rejected.
+          try { real = nodePath.join(nodeFs.realpathSync(nodePath.dirname(resolved)), nodePath.basename(resolved)); }
+          catch { /* parent also missing; fall back to resolved form */ }
+        }
+        if (real !== rootReal && !real.startsWith(rootReal + nodePath.sep)) {
+          throw new OperationError(`run_skillopt: ${label} must resolve within the skills directory for remote callers`, 'permission_denied');
+        }
+      };
+      confine('benchmark_path', p.benchmark_path as string | undefined);
+      confine('held_out_path', heldOutPath);
+    }
     const result = await runSkillOpt({
       engine: ctx.engine,
       skillName,
@@ -4578,6 +4619,7 @@ const run_skillopt: Operation = {
       noMutate: (p.no_mutate as boolean) === true,
       allowMutateBundled: (p.allow_mutate_bundled as boolean) === true,
       bootstrapReviewed: false,
+      ...(heldOutPath ? { heldOutPath } : {}),
       json: true,
       maxCostUsd: (p.max_cost_usd as number) ?? 5.0,
       maxRuntimeMin: 30,

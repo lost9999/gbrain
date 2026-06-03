@@ -1,5 +1,34 @@
 # TODOS
 
+## v0.42.9.0 SkillOpt eval-readiness follow-ups (v0.42+)
+
+Deferred from the v0.42.9.0 wave (held-out gate wiring + ENFORCE + ablation opts).
+Adversarial-review findings that are real but not blockers — the shipped fixes are
+complete and tested; these are hardening/cleanup.
+
+- [ ] **P2 — Extract `promoteCandidate` helper (DRY).** The candidate-promotion
+  sequence (optional `runHeldOutGate` → branch on `mutateDecision.mutate` →
+  `acceptCandidate` else `writeProposed` → set outcome/finalText) is duplicated between
+  the one-shot-rewrite block and the main loop accept branch in
+  `src/core/skillopt/orchestrator.ts`. A future change to the held-out gate or promotion
+  policy must be applied in two places. Extract a shared `promoteCandidate({...})`. Deferred
+  this wave to avoid a >20-line refactor of freshly-tested accept-path code.
+- [ ] **P2 — Harden bundled-skill detection.** `getBundledSkillContext`
+  (`src/core/skillopt/bundled-skill-gate.ts`) only sets `isBundled` when the skills dir was
+  resolved via the `install_path` tier. If the same bundled `skills/` is found via
+  `cwd_walk_up` / `repo_root` / `$GBRAIN_SKILLS_DIR`, `isBundled=false` and the D16 ENFORCE
+  never fires (same weakness governs `--allow-mutate-bundled` itself — pre-existing, not a
+  v0.42.9.0 regression). Fix: compare realpaths against the canonical bundled skills dir
+  independent of detection source.
+- [ ] **P3 — Preflight cost estimate is blind to ablation opts.** `preflight.ts:estimateCost`
+  doesn't know `optimizerMode`/`disableValidationGate`/`reflectMode`, so `--dry-run`
+  over-counts for `one-shot-rewrite` / `failure-only`. Low impact (eval-internal knobs;
+  runtime BudgetTracker enforcement is correct, no overspend) — just a lying preview.
+- [ ] **P3 — `maxRuntimeMin` is enforced only between optimization steps.** The baseline
+  eval, per-step held-out gate, one-shot rewrite, and final-test `scoreSkillOnTasks` calls
+  run unbounded LLM rollouts with no deadline check. BudgetTracker still caps spend; the
+  runtime guarantee is best-effort. Thread the deadline + abortSignal into those phases, or
+  document runtime as best-effort.
 ## v0.42.7.0 extract-in-default-loop follow-ups (v0.42+)
 
 Filed from the v0.42.2.0 wave (#1696 link/timeline extraction freshness

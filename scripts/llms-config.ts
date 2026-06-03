@@ -48,8 +48,25 @@ export const SECTIONS: DocSection[] = [
       {
         title: "CLAUDE.md",
         description:
-          "Architecture reference. Key files, trust boundaries, engine factory, test layout.",
+          "Orientation + resolver. North Star, two axes, architecture + cross-cutting invariants, the reference map pointing at on-demand docs, and the inline ship IRON RULES.",
         path: "CLAUDE.md",
+      },
+      {
+        title: "docs/architecture/KEY_FILES.md",
+        description:
+          "Per-file index for the gbrain repo: what each src/ file does + its load-bearing invariants. The on-demand detail CLAUDE.md's reference map routes to.",
+        path: "docs/architecture/KEY_FILES.md",
+        // Link-only until compressed to current-state (still large pre-compression).
+        // Flip to inlined once the doc-history compression lands and the bundle
+        // budget is re-measured.
+        includeInFull: false,
+      },
+      {
+        title: "docs/architecture/thin-client.md",
+        description:
+          "The thin-client / remote-MCP / cross-modal routing seam: isThinClient detection, callRemoteTool, SSRF-hardened URL validation, per-command routing.",
+        path: "docs/architecture/thin-client.md",
+        includeInFull: false,
       },
       {
         title: "INSTALL_FOR_AGENTS.md",
@@ -87,6 +104,9 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
+        // Re-inlined: the CLAUDE.md resolver restructure (per-file index moved to
+        // docs/architecture/KEY_FILES.md, link-only) freed ~530KB of bundle
+        // headroom, so this value-explainer rides the single-fetch bundle again.
         title: "docs/what-schemas-unlock.md",
         description:
           "Why schemas matter: 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) + the structural argument for typed page kinds. Read this before pitching schema authoring (v0.40.7.0).",
@@ -206,6 +226,26 @@ export const SECTIONS: DocSection[] = [
         description:
           "Release-summary voice + itemized changes + self-repair block per version.",
         path: "CHANGELOG.md",
+        includeInFull: false,
+      },
+    ],
+  },
+  {
+    heading: "Contributing",
+    optional: true,
+    entries: [
+      {
+        title: "docs/TESTING.md",
+        description:
+          "Test command tiers, the test-isolation lint (R1-R4), the canonical PGLite block, withEnv, the E2E DB lifecycle, and the file taxonomy. Maintainer-facing.",
+        path: "docs/TESTING.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/RELEASING.md",
+        description:
+          "Full release + contributor process: pre-ship test requirements, the CHANGELOG voice + release-summary template, the 'To take advantage of vX' block, version migrations, GitHub Actions SHA refresh, PR conventions, community-PR-wave. (Ship IRON RULES stay inline in CLAUDE.md.)",
+        path: "docs/RELEASING.md",
         includeInFull: false,
       },
     ],

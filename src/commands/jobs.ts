@@ -1750,6 +1750,7 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
       noMutate: Boolean(data.no_mutate),
       allowMutateBundled: Boolean(data.allow_mutate_bundled),
       bootstrapReviewed: Boolean(data.bootstrap_reviewed),
+      ...(data.held_out_path ? { heldOutPath: String(data.held_out_path) } : {}),
       json: true,
       maxCostUsd: Number(data.max_cost_usd ?? 5.0),
       maxRuntimeMin: Number(data.max_runtime_min ?? 30),
