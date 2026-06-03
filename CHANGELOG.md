@@ -2,6 +2,65 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.13.0] - 2026-06-02
+
+**Pages under `archive/` are findable again.** If you committed a note to your brain under `archive/` (old conversation exports, prior-system logs, notes you filed away), GBrain was embedding it and graphing it but then hiding it from every search. You would search for an exact phrase you knew was in the page, get nothing back, and conclude the page did not exist. It did. A hardcoded list was quietly dropping the whole `archive/` subtree from results unless you knew to pass a special flag.
+
+The rule should be simple: if it is committed to your brain, it should be findable. So `archive/` is no longer hidden. It is now ranked a bit lower than your curated content (essays, concepts, people) so old archived material does not crowd out your best pages, but it shows up. A genuinely strong match in `archive/` can still rise to the top when the reranker says it is the best answer.
+
+`test/`, `attachments/`, and `.raw/` stay hidden. Those are real noise.
+
+You do not need to do anything. Re-run a search that used to come up empty:
+
+```
+gbrain search "<a phrase you know is in an archived page>"
+```
+
+New `gbrain doctor` check `hidden_by_search_policy` reports how many pages are still withheld from default search by the remaining exclude prefixes, so an empty result is never silently a policy decision again:
+
+```
+gbrain doctor --json    # look for the hidden_by_search_policy check
+```
+
+**What you would see in a search for "widget"** when `concepts/widget-pattern` and `archive/old/widget-2020` both match:
+
+| Page | Before | After |
+|---|---|---|
+| `concepts/widget-pattern` | returned (rank 1) | returned (rank 1) |
+| `archive/old/widget-2020` | **withheld** | returned (rank 2, demoted) |
+| `test/fixtures/widget` | withheld | withheld |
+
+**Things to watch after upgrade:** the search result cache gets a one-time full refresh on first use (the exclude-policy change is folded into the cache key so stale archive-excluded results can not be served); it refills within an hour. If you run the contradictions probe, archived pages now classify in its `bulk` source tier instead of `other` — archive is bulk-ish historical content, so that is the right bucket.
+
+## To take advantage of v0.42.13.0
+
+`gbrain upgrade` handles this automatically. There is no migration. If a search that should return an archived page still comes up empty after upgrade:
+
+1. **Confirm the page is in the brain and chunked:**
+   ```bash
+   gbrain doctor --json    # hidden_by_search_policy lists what's withheld by prefix
+   ```
+   `archive/` should NOT appear in that list. `test/` / `attachments/` / `.raw/` may.
+2. **Re-run the search:**
+   ```bash
+   gbrain search "<phrase from the archived page>"
+   ```
+3. **If it still misses,** the page may genuinely have no chunks (never embedded). Run `gbrain embed --stale`, then search again.
+4. **If something looks wrong,** file an issue: https://github.com/garrytan/gbrain/issues with your `gbrain doctor` output and the query.
+
+### Itemized changes
+
+- `archive/` removed from `DEFAULT_HARD_EXCLUDES` and added to `DEFAULT_SOURCE_BOOSTS` at `0.5` (`src/core/search/source-boost.ts`). Findable by default, ranked below curated content. The demote is a prior applied in the SQL/fusion layer; the cross-encoder reranker can still promote a strongly-matching archive page that survives the demote into the rerank candidate window.
+- New `gbrain doctor` check `hidden_by_search_policy` (`src/commands/doctor.ts`, wired into both the local and remote/thin-client paths; `src/core/doctor-categories.ts`). Counts chunked pages withheld by each active exclude prefix in one SQL query, reusing the canonical `resolveHardExcludes` + `buildVisibilityClause` + `escapeLikePattern` so the count mirrors what search actually filters. `ok` for intentional default excludes (with a prescriptive, agent-readable message), `warn` only when a non-default `GBRAIN_SEARCH_EXCLUDE` prefix is hiding pages.
+- `KNOBS_HASH_VERSION` bumped 8 to 9 (`src/core/search/mode.ts`). The search-exclude policy is not part of the cache key, so the bump is what invalidates archive-excluded `query_cache` rows on upgrade. One-time global cache cold-miss; refills within `cache.ttl_seconds`.
+- `escapeLikePattern` is now exported from `src/core/search/sql-ranking.ts` (was test-only) so the doctor check escapes env-supplied prefixes with `ESCAPE '\'` instead of re-implementing it.
+- Docs + comment sweep: `docs/architecture/RETRIEVAL.md`, `src/core/types.ts`, `src/core/postgres-engine.ts` no longer describe `archive/` as a default hard-exclude.
+
+### For contributors
+
+- Verified on both PGLite (in-memory e2e) and real Postgres (seeded container smoke): archive findable + demoted below curated, `test/`/`.raw/`/`attachments/` still hidden, the new doctor SQL runs clean on both engines.
+- Side-effect documented above: adding `archive/: 0.5` to `DEFAULT_SOURCE_BOOSTS` reclassifies archive pages in the contradictions probe's source-tier breakdown (`src/core/eval-contradictions/cross-source.ts`) from `other` to `bulk` (boost < 0.95). Benign; no code change.
+
 ## [0.42.10.0] - 2026-06-02
 
 **Wikilinks like `[[struktura]]` that point at pages in another folder finally connect.** Until now, if you wrote `[[struktura]]` in `concepts/knowledge-graph.md` and the actual page lived at `projects/struktura.md`, GBrain silently dropped the link from its graph. Obsidian users saw a dense web of connections in their vault and a thin, broken graph inside GBrain. The issue reporter had 71 wikilinks across 20 pages — GBrain captured 12.
