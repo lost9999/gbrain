@@ -2,6 +2,32 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.13.0] - 2026-06-03
+
+**A scheduled `gbrain sync` can no longer spin forever and pile up dead processes, and `gbrain doctor` stops showing "100% of pages need link extraction" right after you ran the thing that's supposed to fix it.**
+
+Two unrelated bugs, both reported from real Postgres/Supabase brains, both fixed here.
+
+The first one is the scary one. A `gbrain sync --source <id>` fired from cron could get stuck in a busy loop, peg a CPU core, and ignore `Ctrl-C` and `kill` (only `kill -9` stopped it). When the cron parent exited, the stuck sync was left orphaned, and the next cron tick spawned another. One reporter woke up to 13 of them, 24+ hours old, thrashing a 16 GB Mac mini down to 121 MB free. The root cause: when a sync spins on synchronous work, it starves its own event loop, so the SIGTERM handler and `--timeout` that gbrain already had could never actually run.
+
+The fix is a watchdog that runs on a separate OS thread and kills the process from outside the starved loop. On a non-interactive run (cron), gbrain now arms a hard deadline by default (1 hour), sends SIGTERM at the deadline for a clean exit, and SIGKILL shortly after if the process is too wedged to respond. A runaway sync now dies on its own instead of piling up. Sync is resumable, so a deadline-hit run just picks up next tick.
+
+- **Default on for cron, off for you at the keyboard.** Interactive (TTY) syncs stay unbounded. Tune the cron deadline with `GBRAIN_SYNC_MAX_RUNTIME_SECONDS=N`, set a one-off with `gbrain sync --hard-deadline 600`, or opt out with `--no-hard-deadline`. `gbrain sync --source x --timeout 300` now also arms the hard backstop automatically.
+- **`Ctrl-C` is clean now too.** Hitting Ctrl-C during a long sync returns a partial result and releases the lock through the normal path, instead of a hard cut that could leave the sync lock stuck until its TTL expired.
+- **The spin itself isn't root-caused yet** (it needs a live reproduction; the leading suspect is a pathological regex in a schema pack's link rules, already partly mitigated). The watchdog makes the *symptom* impossible. A `[sync-watchdog]` heartbeat line in your logs, plus the existing `[gbrain phase]` lines, will pinpoint where the next one hangs.
+
+The second fix: on Postgres, `gbrain doctor`'s `links_extraction_lag` check was permanently stuck at 100%. You'd run `gbrain extract --stale`, it would stamp every page as extracted, and the check would still say every page needs extraction. The stamp was being truncated to millisecond precision while the database kept microseconds, so "last extracted" always looked a hair older than "last updated." Now the stamp carries full microsecond precision and the check clears the moment extraction runs. (Postgres-only; the health score stops being dragged down by a check that could never pass.)
+
+## To take advantage of v0.42.13.0
+
+`gbrain upgrade` is all that's required — both fixes are automatic. Two things worth knowing:
+
+1. **Scheduled (non-interactive) syncs now have a 1-hour hard deadline by default.** If you run a legitimately long sync from cron (e.g. a first import of a very large brain), raise it: `GBRAIN_SYNC_MAX_RUNTIME_SECONDS=14400 gbrain sync ...` (4h), pass `gbrain sync --hard-deadline <seconds>`, or opt out with `--no-hard-deadline`. Interactive runs at your keyboard are unbounded as before.
+2. **Verify the link-extraction fix (Postgres):** `gbrain extract --stale` then `gbrain doctor` — the `links_extraction_lag` check should now read near 0% and stay there on a re-run (it was stuck at 100%).
+
+### For contributors
+- New reusable primitive `src/core/process-watchdog.ts` (Bun worker-thread self-kill, `eval:true` so it survives `bun --compile`); `resolveSyncHardDeadline` + `composeAbortSignals` in `sync.ts`; watchdog armed in `cli.ts` before `connectEngine` (bounds connect-phase hangs). #1768 fix threads a full-µs `updated_at_iso` (projected via `to_char(... AT TIME ZONE 'UTC', '…US"Z"')`) into `StalePageRow`; the `markPagesExtractedBatch` SQL is unchanged so the version-arm / CDX-1 tests stay green. New tests: `test/process-watchdog.test.ts` (+ `.serial`), `test/sync-hard-deadline.test.ts`, and a deterministic µs regression in `test/extract-stale.test.ts`. Eng review + Codex outside-voice both cleared the plan (Codex empirically validated the worker-self-kill on Bun 1.3.13).
+
 ## [0.42.10.0] - 2026-06-02
 
 **Wikilinks like `[[struktura]]` that point at pages in another folder finally connect.** Until now, if you wrote `[[struktura]]` in `concepts/knowledge-graph.md` and the actual page lived at `projects/struktura.md`, GBrain silently dropped the link from its graph. Obsidian users saw a dense web of connections in their vault and a thin, broken graph inside GBrain. The issue reporter had 71 wikilinks across 20 pages — GBrain captured 12.
