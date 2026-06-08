@@ -149,6 +149,7 @@ project resolves through `src/core/search/mode.ts`.
 | `intentWeighting`             | true           | true       | true           |
 | `tokenBudget`                 | **4000**       | **12000**  | **off**        |
 | `expansion` (LLM multi-query) | false          | false      | **true**       |
+| `relationalRetrieval`         | false          | **true**   | **true**       |
 | `searchLimit` default         | 10             | 25         | 50             |
 
 **Cost anchors (downstream agent input cost — gbrain itself is rounding error).**
@@ -206,6 +207,19 @@ through `embedding_voyage` (1024d Voyage) can't be served a cache row
 written against `embedding` (1536d OpenAI). Existing v=2 rows become
 unreachable on first re-query (one-time miss spike on upgrade);
 `mode.ts:KNOBS_HASH_VERSION` is the single source of truth.
+
+**v0.42.34.0 knobs_hash v=9 → v=10.** Folds the `relationalRetrieval` knob +
+depth into the cache key so a relational-on result set can't be served to a
+relational-off lookup (same contamination class as graph_signals). One-time
+miss spike on upgrade.
+
+**Relational retrieval (v0.42.34.0).** `relationalRetrieval` (on for
+balanced/tokenmax) adds a fourth recall arm: a relational query ("who invested
+in X", "what connects A and B") resolves its seed entity and walks the typed-edge
+graph (`src/core/search/relational-recall.ts` + `relational-intent.ts`,
+`engine.relationalFanout`), injecting edge-derived answers into RRF. Within-source,
+deterministic, mentions-excluded by default, pure no-op for non-relational queries.
+The `query` op's `relational` flag forces it on/off per call.
 
 **Three CLI surfaces:**
 
