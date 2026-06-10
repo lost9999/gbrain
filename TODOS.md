@@ -89,8 +89,9 @@ context). Deliberately scoped OUT of that PR. See plan + GSTACK REVIEW REPORT at
   batch error, retry the batch element-by-element so one bad row can't abort a
   353K-page `extract --stale` sweep, logging the offending `(from_slug, context)`
   instead of dying. The durable JSONB fix removed the known crash class (malformed
-  array literal) and NUL-stripping removed the other known jsonb-parse failure, so
-  there is no remaining data-dependent crash for this to catch *today* — it's
+  array literal), NUL-stripping removed a second jsonb-parse failure, and
+  v0.42.39.0 lone-surrogate well-forming (#2011) removed a third, so there is no
+  remaining *known* data-dependent crash for this to catch *today* — it's
   belt-and-suspenders against unknown future per-row failures. Wire it in
   `addLinksBatch`/`addTimelineEntriesBatch`/`addTakesBatch` (or in `batchRetry` as
   a post-classification fallback). Issue #1861 option 2.
