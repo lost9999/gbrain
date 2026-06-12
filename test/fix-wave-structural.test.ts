@@ -216,9 +216,10 @@ describe('#2084 — cli.ts owns process-exit teardown via finishCliTeardown', ()
 
   test('pglite-engine contains the Emscripten process.exitCode hijack', () => {
     // PGLite's WASM runtime writes its own status into process.exitCode (99
-    // alive / exit status on close) and ignores `undefined` assignment. Both
-    // lifecycle calls must run inside preservingProcessExitCode or PGLite
-    // error exits silently report success again.
+    // alive / exit status on close) and ignores `undefined` assignment. The
+    // create call runs inside preservingProcessExitCode to keep the global
+    // tidy; close is deliberately unwrapped (see below) — the CLI's verdict
+    // is immune either way via the owned channel.
     const src = readFileSync('src/core/pglite-engine.ts', 'utf8');
     expect(src).toMatch(/preservingProcessExitCode\(\(\)\s*=>\s*\n?\s*PGlite\.create/);
     // close stays UNWRAPPED by design: its status write is baseline behavior

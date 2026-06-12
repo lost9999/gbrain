@@ -21,6 +21,10 @@ import {
   type MinimalWritable,
 } from '../src/core/cli-force-exit.ts';
 import { POOL_END_TIMEOUT_SECONDS } from '../src/core/db.ts';
+import {
+  backgroundWorkSinkCount,
+  __registerDrainerForTest,
+} from '../src/core/background-work.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -67,6 +71,47 @@ describe('computeTeardownDeadlineMs', () => {
         computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 }),
       ).toBe(TEARDOWN_DEADLINE_FLOOR_MS);
     });
+  });
+
+  test('zero and negative env values fall back to the formula (not "fire immediately")', async () => {
+    await withEnv({ GBRAIN_TEARDOWN_DEADLINE_MS: '0' }, async () => {
+      expect(computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 })).toBe(
+        TEARDOWN_DEADLINE_FLOOR_MS,
+      );
+    });
+    await withEnv({ GBRAIN_TEARDOWN_DEADLINE_MS: '-5' }, async () => {
+      expect(computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 })).toBe(
+        TEARDOWN_DEADLINE_FLOOR_MS,
+      );
+    });
+  });
+
+  test('a newly registered sink widens the computed deadline (D9: formula reads the live registry)', () => {
+    // Register two sinks and compare between them: in a bare unit-test process
+    // no production sinks are loaded, so the zero-sink baseline sits below the
+    // 10s floor and would mask the first sink's delta.
+    const mkSink = (name: string) =>
+      __registerDrainerForTest({ name, order: 99, drain: async () => ({ unfinished: 0 }) });
+    const un1 = mkSink('test-2084-sink-a');
+    try {
+      const withOne = computeTeardownDeadlineMs({
+        sinkCount: backgroundWorkSinkCount(),
+        drainTimeoutMs: 5000,
+      });
+      const un2 = mkSink('test-2084-sink-b');
+      try {
+        const withTwo = computeTeardownDeadlineMs({
+          sinkCount: backgroundWorkSinkCount(),
+          drainTimeoutMs: 5000,
+        });
+        expect(withOne).toBeGreaterThan(TEARDOWN_DEADLINE_FLOOR_MS); // above the floor — delta is visible
+        expect(withTwo).toBe(withOne + 5000);
+      } finally {
+        un2();
+      }
+    } finally {
+      un1();
+    }
   });
 });
 
@@ -233,6 +278,8 @@ describe('verdict channel — immune to PGLite WASM process.exitCode writes', ()
       expect(currentExitCode()).toBe(0); // no gbrain verdict was ever set
       setCliExitVerdict(2);
       expect(currentExitCode()).toBe(2);
+      // The mirror write exists for EXTERNAL readers of the global.
+      expect(process.exitCode).toBe(2);
     } finally {
       _resetCliExitVerdictForTests();
       process.exitCode = 0;
@@ -241,6 +288,26 @@ describe('verdict channel — immune to PGLite WASM process.exitCode writes', ()
 });
 
 describe('finishCliTeardown — disconnect failure (D3: exit code reports the op)', () => {
+  test('a throwing drain is warned, disconnect still runs, helper resolves', async () => {
+    // The registry is contractually non-throwing; this pins the defense-in-depth
+    // guard — a drain rejection must not skip disconnect or escape the caller's
+    // finally (it would replace a successful op's completion).
+    const calls: string[] = [];
+    const warns: string[] = [];
+    await finishCliTeardown({
+      engine: { disconnect: async () => void calls.push('disconnect') },
+      deadlineMs: 1000,
+      drain: async () => {
+        throw new Error('sink registry blew up');
+      },
+      exit: () => {},
+      warn: (m) => void warns.push(m),
+    });
+    expect(calls).toEqual(['disconnect']);
+    expect(warns.length).toBe(1);
+    expect(warns[0]).toContain('sink registry blew up');
+  });
+
   test('disconnect throw is warned and swallowed; helper resolves', async () => {
     const warns: string[] = [];
     const exits: number[] = [];

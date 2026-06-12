@@ -102,6 +102,8 @@ export function computeTeardownDeadlineMs(opts: {
 }): number {
   const env = Number(process.env.GBRAIN_TEARDOWN_DEADLINE_MS);
   if (Number.isFinite(env) && env > 0) return env;
+  // +500 mirrors endPoolBounded's slack over the postgres.js hint (db.ts);
+  // ×2 budgets the worst case of two sequential pool ends (direct + read).
   const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
   const computed =
     opts.sinkCount * opts.drainTimeoutMs +
@@ -268,7 +270,16 @@ export async function finishCliTeardown(opts: FinishCliTeardownOpts): Promise<vo
   backstop.unref?.();
 
   try {
-    await drain({ timeoutMs: drainTimeoutMs });
+    try {
+      await drain({ timeoutMs: drainTimeoutMs });
+    } catch (e) {
+      // The registry is contractually non-throwing, but a throw here must not
+      // skip the disconnect or escape a caller's finally (it would replace a
+      // successful op's completion). Same D3 posture as the disconnect guard.
+      warn(
+        `[cli] background-work drain failed during teardown: ${e instanceof Error ? e.message : String(e)} — continuing to disconnect`,
+      );
+    }
     try {
       await opts.engine.disconnect();
     } catch (e) {

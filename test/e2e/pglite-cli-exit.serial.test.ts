@@ -377,10 +377,14 @@ describe('#2084 — explicit-exit teardown: every swept site exits clean, exit c
   }, 45_000);
 
   test('D11: teardown deadline does NOT cover handler time (slow-handler regression)', async () => {
-    // Pre-#2084 the hard-deadline timer armed BEFORE the op handler, so with a
-    // 500ms deadline this spawn would force-exit mid-handler with exit 0 and
-    // empty stdout. Post-fix the timer arms at teardown start: the handler runs
-    // to completion and the results print regardless of the tiny deadline.
+    // Post-fix the deadline arms at teardown start, so a 500ms deadline cannot
+    // touch the handler: results print in full regardless. NOTE the falsification
+    // story is forward-looking, not historical — pre-#2084 code had no env knob
+    // (a static 10s constant), so this spawn would pass there too; the guard
+    // against re-hoisting the timer above the handler is the structural pin on
+    // DISCONNECT_HARD_DEADLINE_MS absence in fix-wave-structural.test.ts. This
+    // test pins that the env override is honored AND output survives a deadline
+    // far smaller than handler time.
     const { code, stdout, durationMs } = await runWithTimeout(
       ['search', 'foxtrot', '--limit', '3'],
       15_000,
