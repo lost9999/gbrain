@@ -187,10 +187,10 @@ export async function writeSingleFact(
     // stubGuardBlocked / defensive legacyFallback → DB-only path below.
   }
 
-  const inserted = await engine.insertFact(newFact, {
+  const inserted = await engine.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
     source_id: sourceId,
     ...(supersedeId !== null ? { supersedeId } : {}),
-  }); // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
+  });
 
   return {
     id: inserted.id,

@@ -36,8 +36,19 @@ export interface VerbUsageEvent {
   entity_found?: boolean;
 }
 
+let _pathOverride: string | null = null;
+
+/**
+ * Test-only seam: redirect the sidecar to a temp file without mutating
+ * process.env.GBRAIN_HOME (the test-isolation lint forbids global env
+ * mutation). Pass null to restore. @internal exported for tests.
+ */
+export function __setUsageLogPathForTests(path: string | null): void {
+  _pathOverride = path;
+}
+
 export function usageLogPath(): string {
-  return gbrainPath('integrations', 'memory-verbs', 'usage.jsonl');
+  return _pathOverride ?? gbrainPath('integrations', 'memory-verbs', 'usage.jsonl');
 }
 
 /** The resolved gbrain home — the per-brain disambiguator for multi-brain stats. */

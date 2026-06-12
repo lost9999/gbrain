@@ -43,15 +43,15 @@ import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
 } from '../src/core/ai/gateway.ts';
+import { __setUsageLogPathForTests } from '../src/core/verbs/usage-log.ts';
 
 let engine: PGLiteEngine;
 let home: string;
-const prevHome = process.env.GBRAIN_HOME;
 
 beforeAll(async () => {
-  // Sidecar + config reads route through gbrainPath — keep them in a temp home.
+  // Sidecar writes go to a temp file via the test seam — no global env mutation.
   home = mkdtempSync(join(tmpdir(), 'gbrain-verbs-test-'));
-  process.env.GBRAIN_HOME = home;
+  __setUsageLogPathForTests(join(home, 'usage.jsonl'));
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -59,8 +59,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
-  if (prevHome === undefined) delete process.env.GBRAIN_HOME;
-  else process.env.GBRAIN_HOME = prevHome;
+  __setUsageLogPathForTests(null);
   try { rmSync(home, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
@@ -263,13 +262,29 @@ describe('synthesize — marked expensive + unavailable conversion [c10]', () =>
     expect(def.annotations?.title).toContain('costly');
   });
 
-  it('returns a clean `unavailable` protocol error with a suggestion when no LLM is configured', async () => {
+  it('delegates to runThink and returns the frozen envelope with a priced cost block (chat seam — no real LLM)', async () => {
+    // Hermetic: the chat transport seam answers deterministically. (The
+    // keyless `unavailable` conversion [c10] is covered end-to-end by the CI
+    // conformance step, which runs `protocol conformance --synthesize` in a
+    // credential-free environment — a unit-level trigger here would depend on
+    // the developer machine NOT having keys, the opposite of hermetic.)
+    __setChatTransportForTests(async () => ({
+      text: JSON.stringify({ answer: 'Synthesized test answer.', citations: [], gaps: ['none'] }),
+      blocks: [],
+      stopReason: 'end' as const,
+      usage: { input_tokens: 1200, output_tokens: 80, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-haiku-4-5-20251001',
+      providerId: 'anthropic',
+    }));
     const { isError, body } = await callRemote('synthesize', { question: 'what do we know?' });
-    expect(isError).toBe(true);
-    expect(body.error).toBe('unavailable');
-    expect(body.suggestion).toContain('recall');
+    expect(isError).toBe(false);
+    expect(body.answer).toBe('Synthesized test answer.');
     expect(body.protocol_version).toBe(1);
-    expect(validateAgainstSchema(body, ERROR_SCHEMA)).toEqual([]);
+    expect(body.cost.input_tokens).toBe(1200);
+    expect(body.cost.output_tokens).toBe(80);
+    expect(Array.isArray(body.sources)).toBe(true);
+    const violations = validateAgainstSchema(body, RESPONSE_SCHEMAS.synthesize);
+    expect(violations).toEqual([]);
   });
 });
 

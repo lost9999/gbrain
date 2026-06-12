@@ -18,7 +18,7 @@
  * drift is caught by the same fixtures that certify servers [c8].
  */
 
-import { operations, operationsByName } from '../core/operations.ts';
+import { operationsByName } from '../core/operations.ts';
 import {
   RESPONSE_SCHEMAS,
   ERROR_SCHEMA,
@@ -296,6 +296,3 @@ function formatDuration(ms: number): string {
 
 /** Test seam: the protocol document, without printing. */
 export { buildProtocolDocument };
-
-// Keep the import alive for the live-defs guarantee even if VERB_NAMES drifts.
-void operations;

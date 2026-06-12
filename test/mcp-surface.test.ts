@@ -23,14 +23,15 @@ import {
   resolveSurface,
 } from '../src/mcp/surface.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
+import { __setUsageLogPathForTests } from '../src/core/verbs/usage-log.ts';
 
 let engine: PGLiteEngine;
 let home: string;
-const prevHome = process.env.GBRAIN_HOME;
 
 beforeAll(async () => {
+  // Sidecar writes go to a temp file via the test seam — no global env mutation.
   home = mkdtempSync(join(tmpdir(), 'gbrain-surface-test-'));
-  process.env.GBRAIN_HOME = home;
+  __setUsageLogPathForTests(join(home, 'usage.jsonl'));
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -38,8 +39,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
-  if (prevHome === undefined) delete process.env.GBRAIN_HOME;
-  else process.env.GBRAIN_HOME = prevHome;
+  __setUsageLogPathForTests(null);
   try { rmSync(home, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
