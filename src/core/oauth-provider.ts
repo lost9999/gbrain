@@ -389,10 +389,18 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // as a fully-admin access token. Mirrors the filter pattern already used
     // by exchangeClientCredentials (this file) and exchangeRefreshToken's F3
     // subset enforcement (RFC 6749 §6) so all three grant entry points clamp
-    // consistently. Empty/omitted requested scope inherits the empty-stored
-    // shape (existing behavior; not a security boundary).
+    // consistently. When the client requests NO scope, RFC 6749 §3.3 lets the
+    // server fall back to a default — we default to the client's full
+    // registered scope (matching exchangeClientCredentials, which already does
+    // `requestedScope ? ... : allowedScopes`). Previously an omitted request
+    // granted the empty set, which then propagated into the access+refresh
+    // tokens and never self-healed: every op failed `insufficient_scope` even
+    // though the client was registered with `read write`. Clients that omit
+    // `scope` on /authorize (e.g. some MCP connectors) hit this. Still clamped
+    // to the allowed set, so an explicit over-broad request can't escalate.
     const allowedScopes = parseScopeString(client.scope);
-    const grantedScopes = (params.scopes || []).filter(s => hasScope(allowedScopes, s));
+    const requestedScopes = (params.scopes && params.scopes.length) ? params.scopes : allowedScopes;
+    const grantedScopes = requestedScopes.filter(s => hasScope(allowedScopes, s));
 
     await this.sql`
       INSERT INTO oauth_codes (code_hash, client_id, scopes, code_challenge,
