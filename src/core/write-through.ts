@@ -22,7 +22,7 @@
  */
 
 import { existsSync, statSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'fs';
-import { dirname } from 'path';
+import { dirname, join } from 'path';
 import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
@@ -37,12 +37,16 @@ export interface WriteThroughResult {
   path?: string;
   /**
    * Non-error reasons the file was not written:
-   *   - no_repo_configured: `sync.repo_path` is unset (DB-only by design).
-   *   - repo_not_found: `sync.repo_path` set but missing / not a directory.
+   *   - no_repo_configured: the resolved target (source `local_path` or, for a
+   *     sole-source brain, `sync.repo_path`) is unset (DB-only by design).
+   *   - repo_not_found: target set but missing / not a directory.
+   *   - source_has_no_local_path: the assigned source has no `local_path` and
+   *     this is NOT a sole-source brain — #2018: we refuse to fall back to the
+   *     global `sync.repo_path`, which may be a sibling source's working tree.
    *   - page_not_found_after_write: the DB row isn't readable back (the caller's
    *     DB write failed or targeted a different source).
    */
-  skipped?: 'no_repo_configured' | 'repo_not_found' | 'page_not_found_after_write';
+  skipped?: 'no_repo_configured' | 'repo_not_found' | 'source_has_no_local_path' | 'page_not_found_after_write';
   /** Set when the render/write/rename itself threw (EACCES, ENOTDIR, disk full). */
   error?: string;
 }
@@ -67,12 +71,43 @@ export async function writePageThrough(
 ): Promise<WriteThroughResult> {
   const sourceId = opts.sourceId ?? 'default';
   try {
-    const repoPath = await engine.getConfig('sync.repo_path');
-    if (!repoPath) {
-      return { written: false, skipped: 'no_repo_configured' };
-    }
-    if (!existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
-      return { written: false, skipped: 'repo_not_found' };
+    // #2018: resolve the disk target from the ASSIGNED source's own working
+    // tree, NOT the global `sync.repo_path`. A source with its own `local_path`
+    // stores files at that tree's root (matching how `scanOneSource` reads them
+    // back); the global path may belong to an unrelated sibling source, and
+    // writing a page there silently pollutes that source's git repo.
+    let filePath: string;
+    const srcRows = await engine.executeRaw<{ local_path: string | null }>(
+      `SELECT local_path FROM sources WHERE id = $1`,
+      [sourceId],
+    );
+    const sourceLocalPath = srcRows[0]?.local_path ?? null;
+    if (sourceLocalPath) {
+      if (!existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
+        return { written: false, skipped: 'repo_not_found' };
+      }
+      // Source's own tree → file at the root (never nested under `.sources/`).
+      filePath = join(sourceLocalPath, `${slug}.md`);
+    } else {
+      // No per-source local_path. Falling back to the global `sync.repo_path`
+      // is ONLY safe when this is the SOLE source — then that path is
+      // unambiguously this source's tree. With multiple sources it may be a
+      // sibling's tree, so skip rather than leak into it (#2018).
+      const cntRows = await engine.executeRaw<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM sources`,
+      );
+      const sourceCount = parseInt(cntRows[0]?.n ?? '1', 10);
+      if (sourceCount > 1) {
+        return { written: false, skipped: 'source_has_no_local_path' };
+      }
+      const repoPath = await engine.getConfig('sync.repo_path');
+      if (!repoPath) {
+        return { written: false, skipped: 'no_repo_configured' };
+      }
+      if (!existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
+        return { written: false, skipped: 'repo_not_found' };
+      }
+      filePath = resolvePageFilePath(repoPath, slug, sourceId);
     }
 
     const writtenPage = await engine.getPage(slug, { sourceId });
@@ -85,7 +120,6 @@ export async function writePageThrough(
       frontmatterOverrides: opts.frontmatterOverrides,
     });
 
-    const filePath = resolvePageFilePath(repoPath, slug, sourceId);
     mkdirSync(dirname(filePath), { recursive: true });
 
     // Atomic write: unique temp sibling + rename. Unique name (pid + random)
