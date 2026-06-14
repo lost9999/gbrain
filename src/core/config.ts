@@ -180,6 +180,14 @@ export interface GBrainConfig {
   retrieval_reflex?: boolean;
   /** Max pointers injected per turn (default 3). File-plane only. */
   retrieval_reflex_max_pointers?: number;
+  /**
+   * v0.43 (#2095) — how many recent turns the reflex extracts entities from
+   * (default 4). 1 reproduces the legacy current-turn-only behavior (and the
+   * legacy slug+title suppression). File-plane / env
+   * (GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS) only — same plane as the other
+   * reflex knobs.
+   */
+  retrieval_reflex_window_turns?: number;
   embedding_image_ocr?: boolean;
   embedding_image_ocr_model?: string;
 
@@ -543,6 +551,10 @@ export function loadConfig(): GBrainConfig | null {
       : {}),
     ...(process.env.GBRAIN_RETRIEVAL_REFLEX
       ? { retrieval_reflex: !(process.env.GBRAIN_RETRIEVAL_REFLEX === 'false' || process.env.GBRAIN_RETRIEVAL_REFLEX === '0') }
+      : {}),
+    ...(process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS &&
+      Number.isFinite(Number(process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS))
+      ? { retrieval_reflex_window_turns: Number(process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS) }
       : {}),
     ...(process.env.GBRAIN_REMOTE_CLIENT_SECRET && fileConfig?.remote_mcp
       ? { remote_mcp: { ...fileConfig.remote_mcp, oauth_client_secret: process.env.GBRAIN_REMOTE_CLIENT_SECRET } }

@@ -79,6 +79,10 @@ export interface EntityCardResult {
 
 interface CardPageRow {
   slug: string;
+  // v0.43 merge: retrieval-reflex's exported PageRow (safeSynopsis's param)
+  // now requires source_id (federated push-context wave #2095). The card row
+  // carries it too so it remains assignable.
+  source_id: string;
   title: string;
   type: string | null;
   frontmatter: Record<string, unknown> | null;
@@ -132,7 +136,7 @@ export async function buildEntityCard(
   let rows: CardPageRow[] = [];
   try {
     rows = await engine.executeRaw<CardPageRow>(
-      `SELECT slug, title, type, frontmatter, compiled_truth, updated_at, last_retrieved_at
+      `SELECT slug, source_id, title, type, frontmatter, compiled_truth, updated_at, last_retrieved_at
          FROM pages
         WHERE deleted_at IS NULL
           AND source_id = $1
@@ -156,7 +160,7 @@ export async function buildEntityCard(
   if (missing.length) {
     try {
       const extra = await engine.executeRaw<CardPageRow>(
-        `SELECT slug, title, type, frontmatter, compiled_truth, updated_at, last_retrieved_at
+        `SELECT slug, source_id, title, type, frontmatter, compiled_truth, updated_at, last_retrieved_at
            FROM pages
           WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])`,
         [sourceId, missing],

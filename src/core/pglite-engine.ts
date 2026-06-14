@@ -264,6 +264,12 @@ export class PGLiteEngine implements BrainEngine {
       }
     }
 
+    // NOTE (#2084): PGLite's Emscripten runtime writes the WASM backend's
+    // proc_exit status into `process.exitCode` (initdb here at create-time,
+    // the postmaster at close-time), and the writes land asynchronously —
+    // a snapshot/restore around these awaits does NOT contain them. That is
+    // why the CLI's exit paths read gbrain's own verdict
+    // (cli-force-exit.ts currentExitCode), never ambient process.exitCode.
     try {
       this._db = await preservingProcessExitCode(() =>
         PGlite.create({
