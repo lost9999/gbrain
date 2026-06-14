@@ -801,8 +801,21 @@ export async function runEnrich(engine: BrainEngine, args: string[]): Promise<vo
     process.exit(1);
   }
 
+  // v0.42.42.0 (#2139, D15A): spend.posture=tokenmax means "cost isn't the
+  // constraint" — the missing-cap refusals below lift and enrich runs UNCAPPED
+  // (maxCostUsd stays undefined → BudgetTracker runs without a ceiling). Spend
+  // is still ledgered by the tracker; posture removes the ceiling, not the
+  // accounting. An explicit --max-usd always wins (precedence: per-call > posture).
+  const { resolveSpendPosture } = await import('../core/spend-posture.ts');
+  const tokenmaxUncapped =
+    !parsed.dryRun && parsed.maxCostUsd === undefined &&
+    (await resolveSpendPosture(engine)) === 'tokenmax';
+  if (tokenmaxUncapped) {
+    console.error('spend.posture=tokenmax: running uncapped, spend ledgered. docs: docs/operations/spend-controls.md');
+  }
+
   // Non-TTY execute without --max-usd or --yes is refused (cost guardrail).
-  if (!parsed.dryRun && parsed.maxCostUsd === undefined && !parsed.yes && !process.stdout.isTTY) {
+  if (!parsed.dryRun && parsed.maxCostUsd === undefined && !parsed.yes && !process.stdout.isTTY && !tokenmaxUncapped) {
     console.error('Refusing to spend without a cap in a non-interactive context. Pass --max-usd <FLOAT> or --yes.');
     process.exit(1);
   }
@@ -812,7 +825,7 @@ export async function runEnrich(engine: BrainEngine, args: string[]): Promise<vo
     : (await listSources(engine)).map((s) => s.id);
 
   // Dry-run cost preview (TTY) before spending.
-  if (!parsed.dryRun && process.stdout.isTTY && !parsed.yes && parsed.maxCostUsd === undefined) {
+  if (!parsed.dryRun && process.stdout.isTTY && !parsed.yes && parsed.maxCostUsd === undefined && !tokenmaxUncapped) {
     const limit = parsed.limit ?? DEFAULT_LIMIT;
     const est = (limit * sourceIds.length * COST_ESTIMATE_PER_PAGE_USD).toFixed(2);
     console.error(`About to enrich up to ${limit} page(s) per source across ${sourceIds.length} source(s), est. ~$${est}. Re-run with --max-usd or --yes to confirm.`);
