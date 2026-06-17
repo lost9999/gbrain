@@ -83,6 +83,9 @@ import {
   type OpCheckpointKey,
 } from '../core/op-checkpoint.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
+import { type DbPacer, createDbPacer, createNoopPacer, observed } from '../core/db-pacer.ts';
+import { resolvePaceMode, loadPaceModeConfig, readPaceEnv } from '../core/pace-mode.ts';
+import { AbortError } from '../core/abort-check.ts';
 
 /**
  * v0.42.x (#1794) -- resumable incremental sync checkpoint.
@@ -2366,6 +2369,27 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // Core import logic shared by serial and parallel paths.
     // repoPath is validated non-null at the top of performSyncInner; narrow for TS.
     const syncRepoPath = repoPath!;
+    // paced-backfill (T3 / C9 / CX4): ONE shared pacer across all worker
+    // engines. This is the multi-pool permit case — each parallel worker owns a
+    // separate PostgresEngine, so a single worker count can't bound TOTAL
+    // concurrent writes; the shared acquire() permit caps them. No-op when
+    // pacing is off. Resolved env > config > bundle (env = incident escape
+    // hatch); fail-open so pacing never breaks a sync.
+    let pacer: DbPacer = createNoopPacer();
+    try {
+      const pcfg = await loadPaceModeConfig(engine);
+      const { envMode, envOverrides } = readPaceEnv();
+      const knobs = resolvePaceMode({
+        mode: pcfg.mode,
+        configOverrides: pcfg.configOverrides,
+        envMode,
+        envOverrides,
+      });
+      if (knobs.enabled) pacer = createDbPacer({ bundle: knobs });
+    } catch {
+      pacer = createNoopPacer();
+    }
+
     async function importOnePath(eng: BrainEngine, path: string): Promise<void> {
       const filePath = join(syncRepoPath, path);
       if (!existsSync(filePath)) {
@@ -2396,13 +2420,24 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // source-prefix-aware, so under --workers>1 / --all the stuck file is the
       // begin-line with no matching completion in the in-flight set.
       if (process.env.GBRAIN_SYNC_TRACE) serr(`[sync] begin import: ${path}`);
+      // paced-backfill: acquire a DB-write permit (caps total concurrent writes
+      // across all worker engines). Throws AbortError on cancel while waiting —
+      // treat as a clean skip; the worker loop sees signal.aborted next tick.
+      let permit;
+      try {
+        permit = await pacer.acquire(opts.signal);
+      } catch (e) {
+        if (e instanceof AbortError) return;
+        throw e;
+      }
       try {
         // v0.18.0+ multi-source: thread `opts.sourceId` so per-page tx writes
         // (putPage / getTags / addTag / removeTag / deleteChunks / upsertChunks
         // / addLink) target (sourceId, slug). Pre-fix the schema DEFAULT
         // 'default' was applied even for non-default sources, fabricating
         // duplicate rows that crashed bare-slug subqueries with Postgres 21000.
-        const result = await importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
+        const result = await observed(pacer, () =>
+          importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
           pagesAffected.push(result.slug);
@@ -2427,12 +2462,23 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         const msg = e instanceof Error ? e.message : String(e);
         serr(`  Warning: skipped ${path}: ${msg}`);
         failedFiles.push({ path, error: msg });
+      } finally {
+        permit.release();
       }
       progress.tick(1, path);
       // v0.42.x (#1794): keep the lock-refresh heartbeat alive on big imports.
       await maybeYield();
+      // paced-backfill: cooperative DB-contention pace between files (no-op when
+      // unpaced). pace() throws AbortError on cancel; the loops break on
+      // signal.aborted, so swallow it here.
+      try {
+        await pacer.pace(opts.signal);
+      } catch (e) {
+        if (!(e instanceof AbortError)) throw e;
+      }
     }
 
+    try {
     if (runParallel) {
       // A1 (v0.22.13): use engine.kind discriminator instead of config?.engine
       // string compare or constructor.name sniff. Q3: belt-and-suspenders fall
@@ -2513,6 +2559,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         }
         await importOnePath(engine, path);
       }
+    }
+    } finally {
+      // paced-backfill: release any blocked acquirers + clear pacer state on
+      // every exit path (including the early partial('timeout') returns above).
+      pacer.dispose();
     }
 
     progress.finish();
