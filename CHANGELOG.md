@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.42.48.0] - 2026-06-16
+## [0.42.49.0] - 2026-06-16
 
 **Big embed backfills and syncs now throttle themselves when the database gets busy, so clearing a backlog can't starve the job queue — no more external babysitter scripts.** A naive `gbrain embed --stale` or large `gbrain sync` against a PgBouncer transaction-mode pooler could saturate it and starve the minion supervisor's lock renewals, cascading `lock-renewal-failed` into dead jobs. The field workaround was an external wrapper that SIGSTOP/SIGCONT'd the process off a side-pool latency probe. That approach was blind (the side pool read low latency while the pool that mattered starved), unsafe (SIGSTOP can freeze a process mid-transaction holding locks), and couldn't touch peak pressure. gbrain now does this natively, and better.
 
@@ -17,7 +17,7 @@ Pacing is **opt-in** (default `off`) and built on one composable primitive: it c
 ### Changed
 - **`gbrain embed --stale` now single-flights per source** using the same lock the `embed-backfill` job holds, so a hand-run backfill and a queued job can't grind the same source concurrently. Paced runs add a bounded end-of-run rescan (catches rows that landed behind the cursor during a longer run), and the embed time budget excludes paced-sleep time so a contended DB still converges instead of exiting early.
 
-### To take advantage of v0.42.48.0
+### To take advantage of v0.42.49.0
 `gbrain upgrade`. Pacing is off by default — nothing changes until you opt in. To clear a big embed backlog safely on a busy pooler: `gbrain embed --stale --pace` (or `--pace=gentle` to be extra conservative). To pace the background embed-backfill job and every embed path automatically: `gbrain config set pace.mode balanced`. During an incident you can override without a redeploy: `GBRAIN_PACE_MODE=gentle` or `GBRAIN_PACE_MAX_CONCURRENCY=4`.
 ## [0.42.46.0] - 2026-06-16
 

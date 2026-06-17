@@ -1,6 +1,6 @@
 # TODOS
 
-## Pace Mode follow-ups (filed v0.42.48.0)
+## Pace Mode follow-ups (filed v0.42.49.0)
 
 Deferred from the paced-backfill wave (CEO + eng review CLEARED). Core shipped:
 `db-pacer` + `pace-mode` wired into embed (CLI + shared core + `embed-backfill`
